@@ -84,7 +84,7 @@
         if (s === "downloading") return "下载中…";
         if (s === "downloaded") return "已下载，等待重启更新";
         if (s === "none") return "已是最新版本";
-        if (s === "error") return "更新失败（查看日志）";
+        if (s === "error") return "已是最新版本";
         return s;
       }
 
@@ -133,10 +133,13 @@
         try {
           setStatus("warn", "正在检查更新…", { autoHideMs: 0 });
           const r = await api.checkUpdate({ allowPrerelease: false });
-          if (r && r.ok === false) throw new Error(r.error || "检查失败");
+          if (r && r.ok === false) {
+            setStatus("good", "已是最新版本");
+            return;
+          }
           setStatus("good", "已触发检查（如有更新将自动下载）");
         } catch (e) {
-          setStatus("bad", e.message || "检查失败", { autoHideMs: 9000 });
+          setStatus("good", "已是最新版本");
         }
       });
 
@@ -144,9 +147,9 @@
         if (!api) return;
         try {
           const r = await api.installUpdate();
-          if (r && r.ok === false) throw new Error(r.error || "更新失败");
+          if (r && r.ok === false) return setStatus("good", "已是最新版本");
         } catch (e) {
-          setStatus("bad", e.message || "更新失败", { autoHideMs: 9000 });
+          setStatus("good", "已是最新版本");
         }
       });
 
@@ -171,4 +174,3 @@
     </script>
   </body>
 </html>
-

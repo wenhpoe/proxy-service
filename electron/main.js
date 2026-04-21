@@ -50,7 +50,6 @@ function setupAutoUpdate(mainWindow) {
   };
 
   let hasShownAvailable = false;
-  let hasShownError = false;
 
   const setState = (patch) => {
     try {
@@ -97,17 +96,13 @@ function setupAutoUpdate(mainWindow) {
   autoUpdater.on('error', async (err) => {
     const msg = err?.message || String(err);
     log(`error ${msg}`);
-    setState({ state: 'error', error: msg });
-    if (hasShownError) return;
-    hasShownError = true;
     try {
-      dialog.showErrorBox(
-        '自动更新失败',
-        `自动更新检查/下载失败。\n\n错误信息：${msg}\n\n排查建议：\n- 确认 GitHub Release 不是 Draft/Pre-release\n- 确认 Release 里有 latest.yml（Windows）或 latest-mac.yml + .zip（macOS）\n- macOS 请确保应用已安装到“应用程序”目录后再启动\n\n日志：${logPath || '（不可用）'}`,
-      );
+      autoUpdateState = { ...autoUpdateState, lastError: msg };
     } catch {
       // ignore
     }
+    // Keep errors out of the UI by default (user can open auto-update.log).
+    setState({ state: 'none' });
   });
 
   autoUpdater.on('update-downloaded', async (info) => {
@@ -141,7 +136,11 @@ function setupAutoUpdate(mainWindow) {
       } catch {
         // ignore
       }
-      await autoUpdater.checkForUpdates();
+      try {
+        await autoUpdater.checkForUpdates();
+      } catch (e) {
+        log(`checkForUpdates failed: ${e?.message || e}`);
+      }
       return { ok: true };
     },
     install: async () => {

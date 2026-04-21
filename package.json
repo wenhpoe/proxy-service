@@ -1,6 +1,6 @@
 {
   "name": "flow-proxy-service",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "private": true,
   "description": "Flow 多账号管理器 - 代理管理服务（本地）",
   "main": "electron/main.js",
