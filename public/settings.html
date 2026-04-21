@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>设置 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/nav.js" defer></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>设置（代理服务）</h1>
+          <div class="sub">包含软件更新、运行信息等。</div>
+        </div>
+        <div class="top-actions">
+          <div class="pill" title="更新状态">
+            <span class="led" id="ledUpdate"></span>
+            <span class="mono" id="pillUpdateText">未检测</span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid">
+        <section class="card" aria-label="软件更新">
+          <div class="card-h">
+            <h2>软件更新</h2>
+            <div class="row">
+              <button class="btn primary" id="btnCheck">检查更新</button>
+              <button class="btn primary" id="btnInstall" hidden>重启并更新</button>
+              <button class="btn" id="btnOpenLog">打开更新日志</button>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="kvmini">
+              <div class="k">当前版本</div>
+              <div class="v mono" id="appVersion">—</div>
+              <div class="k">打包模式</div>
+              <div class="v mono" id="appPackaged">—</div>
+              <div class="k">更新状态</div>
+              <div class="v mono" id="updateState">—</div>
+              <div class="k">更新日志</div>
+              <div class="v mono" id="updateLog">—</div>
+            </div>
+
+            <div class="status" id="status" role="status" aria-live="polite" hidden></div>
+
+            <div class="hint" style="margin-top: 10px">
+              说明：自动更新只对“安装版/打包版”生效；若你正在从 dmg 里直接运行（未拖到“应用程序”），macOS 可能无法更新。
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const api = window.proxyApi || null;
+
+      const $ = (id) => document.getElementById(id);
+      const setStatus = (kind, msg, { autoHideMs = 6000 } = {}) => {
+        const el = $("status");
+        el.className = `status ${kind || ""}`.trim();
+        el.textContent = msg ? String(msg) : "";
+        el.hidden = !el.textContent;
+        if (autoHideMs) {
+          setTimeout(() => {
+            if (!el.hidden) {
+              el.className = "status";
+              el.textContent = "";
+              el.hidden = true;
+            }
+          }, autoHideMs);
+        }
+      };
+
+      function stateText(st) {
+        const s = String(st || "").trim();
+        if (!s || s === "idle") return "未检查";
+        if (s === "checking") return "检查中…";
+        if (s === "available") return "发现新版本，下载中…";
+        if (s === "downloading") return "下载中…";
+        if (s === "downloaded") return "已下载，等待重启更新";
+        if (s === "none") return "已是最新版本";
+        if (s === "error") return "更新失败（查看日志）";
+        return s;
+      }
+
+      function pill(kind, text) {
+        const led = $("ledUpdate");
+        const t = $("pillUpdateText");
+        if (led) led.className = `led ${kind || ""}`.trim();
+        if (t) t.textContent = text || "—";
+      }
+
+      function render(info, patch) {
+        const merged = { ...(info || {}), ...(patch || {}) };
+        $("appVersion").textContent = merged.appVersion || "—";
+        $("appPackaged").textContent = merged.isPackaged ? "是" : "否";
+        $("updateLog").textContent = merged.update?.logPath || merged.logPath || "—";
+
+        const st = merged.update?.state || merged.state || "idle";
+        $("updateState").textContent = stateText(st);
+        $("btnInstall").hidden = st !== "downloaded";
+
+        if (st === "error") pill("bad", stateText(st));
+        else if (st === "downloaded") pill("good", stateText(st));
+        else if (st === "downloading" || st === "checking" || st === "available") pill("warn", stateText(st));
+        else pill("", stateText(st));
+      }
+
+      async function refresh() {
+        if (!api) {
+          setStatus("warn", "当前运行在网页模式（start:server），不支持自动更新。请使用打包后的桌面版。", {
+            autoHideMs: 0,
+          });
+          render({ appVersion: "—", isPackaged: false, update: { state: "idle", logPath: "—" } });
+          return;
+        }
+
+        try {
+          const info = await api.getAppInfo();
+          render(info);
+        } catch (e) {
+          setStatus("bad", e.message || "无法获取应用信息");
+        }
+      }
+
+      $("btnCheck").addEventListener("click", async () => {
+        if (!api) return refresh();
+        try {
+          setStatus("warn", "正在检查更新…", { autoHideMs: 0 });
+          const r = await api.checkUpdate({ allowPrerelease: false });
+          if (r && r.ok === false) throw new Error(r.error || "检查失败");
+          setStatus("good", "已触发检查（如有更新将自动下载）");
+        } catch (e) {
+          setStatus("bad", e.message || "检查失败", { autoHideMs: 9000 });
+        }
+      });
+
+      $("btnInstall").addEventListener("click", async () => {
+        if (!api) return;
+        try {
+          const r = await api.installUpdate();
+          if (r && r.ok === false) throw new Error(r.error || "更新失败");
+        } catch (e) {
+          setStatus("bad", e.message || "更新失败", { autoHideMs: 9000 });
+        }
+      });
+
+      $("btnOpenLog").addEventListener("click", async () => {
+        if (!api) return refresh();
+        try {
+          const r = await api.openUpdateLog();
+          if (r && r.ok === false) throw new Error(r.error || "无法打开日志");
+          setStatus("good", "已打开更新日志");
+        } catch (e) {
+          setStatus("warn", e.message || "无法打开日志", { autoHideMs: 9000 });
+        }
+      });
+
+      if (api && typeof api.onUpdateStatus === "function") {
+        try {
+          api.onUpdateStatus((patch) => refresh().catch(() => {}));
+        } catch {}
+      }
+
+      window.addEventListener("load", () => refresh());
+    </script>
+  </body>
+</html>
+

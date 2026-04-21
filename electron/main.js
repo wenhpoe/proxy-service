@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, dialog } = require('electron');
+const { app, BrowserWindow, shell, dialog, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -12,6 +12,8 @@ app.setName(APP_NAME);
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
 
 let serverHandle = null;
+let autoUpdateCtl = null;
+let autoUpdateState = { state: 'idle', updatedAt: null, logPath: null };
 
 function setupAutoUpdate(mainWindow) {
   if (!app.isPackaged) return;
@@ -36,6 +38,8 @@ function setupAutoUpdate(mainWindow) {
     }
   })();
 
+  autoUpdateState = { state: 'idle', updatedAt: null, logPath };
+
   const log = (line) => {
     const msg = `[${new Date().toISOString()}] ${String(line || '').trim()}\n`;
     try {
@@ -48,12 +52,32 @@ function setupAutoUpdate(mainWindow) {
   let hasShownAvailable = false;
   let hasShownError = false;
 
-  autoUpdater.on('checking-for-update', () => log('checking-for-update'));
-  autoUpdater.on('update-not-available', (info) => log(`update-not-available version=${info?.version || ''}`));
+  const setState = (patch) => {
+    try {
+      autoUpdateState = { ...autoUpdateState, ...patch, updatedAt: new Date().toISOString() };
+    } catch {
+      // ignore
+    }
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('app:updateStatus', patch);
+    } catch {
+      // ignore
+    }
+  };
+
+  autoUpdater.on('checking-for-update', () => {
+    log('checking-for-update');
+    setState({ state: 'checking' });
+  });
+  autoUpdater.on('update-not-available', (info) => {
+    log(`update-not-available version=${info?.version || ''}`);
+    setState({ state: 'none', version: info?.version || null });
+  });
 
   autoUpdater.on('update-available', async (info) => {
     const v = info?.version || null;
     log(`update-available version=${v || ''}`);
+    setState({ state: 'available', version: v });
     if (hasShownAvailable) return;
     hasShownAvailable = true;
     try {
@@ -73,6 +97,7 @@ function setupAutoUpdate(mainWindow) {
   autoUpdater.on('error', async (err) => {
     const msg = err?.message || String(err);
     log(`error ${msg}`);
+    setState({ state: 'error', error: msg });
     if (hasShownError) return;
     hasShownError = true;
     try {
@@ -87,6 +112,7 @@ function setupAutoUpdate(mainWindow) {
 
   autoUpdater.on('update-downloaded', async (info) => {
     log(`update-downloaded version=${info?.version || ''}`);
+    setState({ state: 'downloaded', version: info?.version || null });
     try {
       const r = await dialog.showMessageBox(mainWindow, {
         type: 'info',
@@ -107,6 +133,32 @@ function setupAutoUpdate(mainWindow) {
     log(`checkForUpdates failed: ${e?.message || e}`);
     console.warn(`⚠️ 自动更新检查失败：${e?.message || e}`);
   });
+
+  autoUpdateCtl = {
+    check: async ({ allowPrerelease = false } = {}) => {
+      try {
+        autoUpdater.allowPrerelease = allowPrerelease === true;
+      } catch {
+        // ignore
+      }
+      await autoUpdater.checkForUpdates();
+      return { ok: true };
+    },
+    install: async () => {
+      try {
+        autoUpdater.quitAndInstall();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: e?.message || String(e) };
+      }
+    },
+    openLog: async () => {
+      if (!logPath) return { ok: false, error: 'log path unavailable' };
+      await shell.openPath(logPath);
+      return { ok: true, logPath };
+    },
+    state: () => autoUpdateState
+  };
 }
 
 async function createWindow() {
@@ -152,6 +204,7 @@ async function createWindow() {
     title: 'Proxy Service',
     icon: ICON_PATH,
     webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -184,6 +237,34 @@ app.whenReady().then(async () => {
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) await createWindow();
   });
+});
+
+ipcMain.handle('app:info', async () => ({
+  appVersion: app.getVersion(),
+  isPackaged: app.isPackaged,
+  platform: process.platform,
+  update: autoUpdateCtl ? autoUpdateCtl.state() : autoUpdateState
+}));
+
+ipcMain.handle('update:check', async (_evt, opts) => {
+  if (!autoUpdateCtl) return { ok: false, error: 'auto update not available' };
+  try {
+    return await autoUpdateCtl.check(opts && typeof opts === 'object' ? opts : {});
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+});
+ipcMain.handle('update:install', async () => {
+  if (!autoUpdateCtl) return { ok: false, error: 'auto update not available' };
+  return autoUpdateCtl.install();
+});
+ipcMain.handle('update:openLog', async () => {
+  if (!autoUpdateCtl) return { ok: false, error: 'auto update not available' };
+  try {
+    return await autoUpdateCtl.openLog();
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
 });
 
 async function shutdown() {

@@ -14,6 +14,7 @@
     { href: '/accounts.html', label: '账号仓库' },
     { href: '/codes.html', label: '激活码' },
     { href: '/admin.html', label: '设备管理' },
+    { href: '/settings.html', label: '设置' },
   ];
 
   nav.innerHTML = items
