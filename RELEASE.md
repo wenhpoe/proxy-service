@@ -159,6 +159,10 @@ npm run dist -- --publish always
 
 自动更新只在打包后（`app.isPackaged === true`）启用；开发模式不会。
 
+### 4.1.1 为什么 macOS Release 只有 dmg 也不更新？
+
+macOS 的自动更新依赖 `latest-mac.yml` + `.zip`（由构建流程自动上传）。`dmg` 主要用于“首次安装”，不是自动更新的数据源。
+
 ### 4.2 为什么客户端没发现新版本？
 
 逐项检查：
@@ -186,4 +190,3 @@ npm run dist -- --publish always
 ```bash
 PROXY_AUTO_UPDATE=0
 ```
-

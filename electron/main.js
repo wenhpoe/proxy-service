@@ -1,5 +1,6 @@
 const { app, BrowserWindow, shell, dialog } = require('electron');
 const path = require('path');
+const fs = require('fs');
 
 const APP_NAME = 'Flow 代理管理服务';
 const APP_ID = 'com.internal.flow-proxy-service';
@@ -27,7 +28,65 @@ function setupAutoUpdate(mainWindow) {
 
   autoUpdater.autoDownload = true;
 
+  const logPath = (() => {
+    try {
+      return path.join(app.getPath('userData'), 'auto-update.log');
+    } catch {
+      return null;
+    }
+  })();
+
+  const log = (line) => {
+    const msg = `[${new Date().toISOString()}] ${String(line || '').trim()}\n`;
+    try {
+      if (logPath) fs.appendFileSync(logPath, msg, 'utf8');
+    } catch {
+      // ignore
+    }
+  };
+
+  let hasShownAvailable = false;
+  let hasShownError = false;
+
+  autoUpdater.on('checking-for-update', () => log('checking-for-update'));
+  autoUpdater.on('update-not-available', (info) => log(`update-not-available version=${info?.version || ''}`));
+
+  autoUpdater.on('update-available', async (info) => {
+    const v = info?.version || null;
+    log(`update-available version=${v || ''}`);
+    if (hasShownAvailable) return;
+    hasShownAvailable = true;
+    try {
+      await dialog.showMessageBox(mainWindow, {
+        type: 'info',
+        title: '发现新版本',
+        message: `发现新版本 ${v || ''}，正在后台下载…`,
+        buttons: ['知道了'],
+        defaultId: 0,
+        noLink: true,
+      });
+    } catch {
+      // ignore
+    }
+  });
+
+  autoUpdater.on('error', async (err) => {
+    const msg = err?.message || String(err);
+    log(`error ${msg}`);
+    if (hasShownError) return;
+    hasShownError = true;
+    try {
+      dialog.showErrorBox(
+        '自动更新失败',
+        `自动更新检查/下载失败。\n\n错误信息：${msg}\n\n排查建议：\n- 确认 GitHub Release 不是 Draft/Pre-release\n- 确认 Release 里有 latest.yml（Windows）或 latest-mac.yml + .zip（macOS）\n- macOS 请确保应用已安装到“应用程序”目录后再启动\n\n日志：${logPath || '（不可用）'}`,
+      );
+    } catch {
+      // ignore
+    }
+  });
+
   autoUpdater.on('update-downloaded', async (info) => {
+    log(`update-downloaded version=${info?.version || ''}`);
     try {
       const r = await dialog.showMessageBox(mainWindow, {
         type: 'info',
@@ -45,6 +104,7 @@ function setupAutoUpdate(mainWindow) {
   });
 
   autoUpdater.checkForUpdates().catch((e) => {
+    log(`checkForUpdates failed: ${e?.message || e}`);
     console.warn(`⚠️ 自动更新检查失败：${e?.message || e}`);
   });
 }
