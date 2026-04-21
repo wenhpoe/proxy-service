@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>代理池 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/nav.js" defer></script>
+    <script src="/pager.js" defer></script>
+    <script src="/time.js" defer></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>代理池管理（代理服务）</h1>
+          <div class="sub">
+            这个服务给 <span class="mono">Flow 多账号管理器</span> 提供代理。调用
+            <span class="mono">GET /v1/client/proxy/:profile</span>（客户端令牌）：优先按该账号代理策略（或静态代理），否则从代理池随机返回一个启用条目（HTTP/SOCKS 代理，或
+            <span class="mono">vless://</span>/<span class="mono">hysteria2://</span> 节点）。节点条目会返回结构化节点信息，客户端需用 sing-box/Clash 落地为本地
+            <span class="mono">socks5://127.0.0.1:53182</span> 后再供 Playwright 使用。
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnLogout">退出</button>
+          <div class="pill" title="服务状态">
+            <span class="led" id="led"></span>
+            <span class="mono" id="pillText">检查中…</span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid">
+        <section class="card" aria-label="添加与设置">
+          <div class="card-h">
+            <h2>添加代理</h2>
+            <div class="row">
+              <button class="btn primary" id="btnPick">随机测试</button>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="hint">
+              支持一行一个代理：<span class="mono">ip:port</span> /
+              <span class="mono">http://ip:port</span> /
+              <span class="mono">socks5://ip:port</span>。<br />
+              以 <span class="mono">#</span> 开头的行会被忽略；重复项会自动跳过。
+            </div>
+
+            <div style="height: 10px"></div>
+            <textarea
+              id="txtAdd"
+              placeholder="# 示例&#10;http://127.0.0.1:7890&#10;1.2.3.4:8080"
+            ></textarea>
+
+            <div style="height: 10px"></div>
+            <div class="row">
+              <button class="btn primary" id="btnAdd">添加到代理池</button>
+              <button class="btn" id="btnClear">清空</button>
+            </div>
+
+            <div style="height: 12px"></div>
+            <div class="hint">
+              从供应商接口拉取：填写 URL（会请求一次并把返回的代理解析后加入代理池）。<br />
+              兼容常见返回：纯文本多行、JSON（含 <span class="mono">data/list/items</span> 数组）、以及
+              <span class="mono">host:port:user:pass</span> / <span class="mono">user:pass@host:port</span>。
+            </div>
+            <div style="height: 10px"></div>
+            <input
+              class="input mono"
+              id="fetchUrl"
+              placeholder="https://apisocks.example.com/api/getIpInfo?key=...&num=1"
+            />
+            <div style="height: 10px"></div>
+            <div class="row">
+              <button class="btn primary" id="btnFetch">拉取并加入</button>
+              <input class="input" id="fetchLabel" placeholder="可选标签（例如 美国-01）" style="max-width: 240px" />
+            </div>
+
+            <div style="height: 12px"></div>
+            <div class="row">
+              <span class="chip"><span class="mono">存储</span> <strong id="storePath">—</strong></span>
+              <span class="chip"><span class="mono">总数</span> <strong id="poolCount">0</strong></span>
+              <span class="chip"><span class="mono">启用</span> <strong id="poolEnabled">0</strong></span>
+            </div>
+
+            <div class="status" id="status" role="status" aria-live="polite" hidden></div>
+
+          </div>
+        </section>
+
+        <section class="card" aria-label="代理池列表">
+          <div class="card-h">
+            <h2>代理池</h2>
+            <div class="row">
+              <input class="input" id="search" placeholder="搜索（条目 / 标签）" style="width: 240px" />
+              <button class="btn" id="btnOnlyEnabled" aria-pressed="false" title="只看启用">只看启用</button>
+              <select id="pageSize" style="width: 110px"></select>
+              <button class="btn" id="pagePrev">上一页</button>
+              <button class="btn" id="pageNext">下一页</button>
+              <span class="chip"><span class="mono" id="pageInfo">—</span></span>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="toolbar">
+              <div class="sub">
+                勾选启用开关即刻生效；标签会自动保存。点击“复制”：代理条目复制地址（不含密码），节点条目复制分享链接（包含 uuid/密码）。
+              </div>
+              <div class="row" style="justify-content: space-between; flex-wrap: wrap">
+                <div class="row">
+                  <input
+                    class="input mono"
+                    id="checkUrl"
+                    placeholder="检测 URL（例如 https://www.google.com/generate_204）"
+                    style="width: 360px"
+                    autocomplete="off"
+                  />
+                  <select id="checkMethod" style="width: 90px">
+                    <option value="HEAD">HEAD</option>
+                    <option value="GET">GET</option>
+                  </select>
+                </div>
+                <button class="btn danger" id="btnPurgeDisabled" title="删除所有禁用项">清理禁用</button>
+              </div>
+            </div>
+            <div style="height: 10px"></div>
+
+            <div class="tablebox" style="max-height: 62vh">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width: 74px">启用</th>
+                    <th>条目</th>
+                    <th style="width: 220px">标签</th>
+                    <th style="width: 240px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      async function j(url, opts) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+          throw new Error("未登录");
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
+        return data;
+      }
+
+      function setStatus(kind, text, { autoHideMs = 5200 } = {}) {
+        const el = $("status");
+        if (!text) {
+          el.hidden = true;
+          el.className = "status";
+          el.textContent = "";
+          return;
+        }
+        el.hidden = false;
+        el.className = `status ${kind || ""}`.trim();
+        el.textContent = text;
+        if (autoHideMs > 0) {
+          clearTimeout(setStatus._t);
+          setStatus._t = setTimeout(() => setStatus("", ""), autoHideMs);
+        }
+      }
+
+      function esc(s) {
+        return String(s || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function ts(s) {
+        try {
+          return window.fmaFmtChinaTime ? window.fmaFmtChinaTime(s) : String(s || "—");
+        } catch {
+          return String(s || "—");
+        }
+      }
+
+      function maskCred(server, proxy) {
+        if (!proxy) return server;
+        if (!proxy.username && !proxy.password) return server;
+        const u = proxy.username ? `${proxy.username}:***@` : "***@";
+        try {
+          const url = new URL(server);
+          return `${url.protocol}//${u}${url.host}${url.pathname || ""}`;
+        } catch {
+          return server;
+        }
+      }
+
+      function itemKind(it) {
+        const k = String(it?.kind || "").trim().toLowerCase();
+        if (k === "node" || k === "proxy") return k;
+        if (it?.node) return "node";
+        if (it?.proxy) return "proxy";
+        return "unknown";
+      }
+
+      function safeDecodeURIComponent(s) {
+        try {
+          return decodeURIComponent(String(s || ""));
+        } catch {
+          return String(s || "");
+        }
+      }
+
+      function parseNodeBrief(node) {
+        const n = node && typeof node === "object" ? node : null;
+        const fullLink =
+          typeof node === "string" ? node.trim() : typeof n?.fullLink === "string" ? n.fullLink.trim() : "";
+
+        let protocol = String(n?.protocol || n?.type || "").trim();
+        let host = String(n?.host || "").trim();
+        let port = n?.port != null ? String(n.port).trim() : "";
+        let remark = String(n?.title || n?.remark || "").trim();
+        let country = String(n?.country || "").trim();
+
+        if (fullLink) {
+          try {
+            const fake = fullLink.startsWith("vless://")
+              ? fullLink.replace(/^vless:\/\//i, "https://")
+              : fullLink.replace(/^hysteria2:\/\//i, "https://");
+            const u = new URL(fake);
+            if (!host) host = String(u.hostname || "").trim();
+            if (!port) port = String(u.port || "").trim();
+            if (!remark && u.hash) remark = safeDecodeURIComponent(String(u.hash).slice(1));
+            if (!protocol) {
+              protocol = fullLink.startsWith("vless://")
+                ? "vless"
+                : fullLink.startsWith("hysteria2://")
+                  ? "hysteria2"
+                  : "";
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        protocol = String(protocol || "").trim().toLowerCase();
+        return { fullLink, protocol, host, port, remark, country };
+      }
+
+      function matchItem(it, q) {
+        if (!q) return true;
+        const s = String(q).trim().toLowerCase();
+        const id = String(it?.id || "").toLowerCase();
+        const a = String(it?.proxy?.server || "").toLowerCase();
+        const b = String(it?.label || "").toLowerCase();
+        const n = parseNodeBrief(it?.node);
+        const c = String(n?.remark || "").toLowerCase();
+        const d = String(n?.host || "").toLowerCase();
+        const e = String(n?.country || "").toLowerCase();
+        const f = String(n?.protocol || "").toLowerCase();
+        return (
+          id.includes(s) ||
+          a.includes(s) ||
+          b.includes(s) ||
+          c.includes(s) ||
+          d.includes(s) ||
+          e.includes(s) ||
+          f.includes(s)
+        );
+      }
+
+      let state = {
+        items: [],
+        onlyEnabled: false,
+        storePath: "—",
+      };
+
+      let pager = null;
+      let checkInited = false;
+
+      function render() {
+        const tbody = $("tbody");
+        const q = $("search").value || "";
+        const filtered = state.items
+          .filter((it) => (state.onlyEnabled ? it.enabled !== false : true))
+          .filter((it) => matchItem(it, q));
+
+        const pageItems = pager ? pager.slice(filtered) : filtered;
+
+        tbody.innerHTML = "";
+        if (!filtered.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="4" style="padding:14px">
+            <div class="sub">没有匹配项。</div>
+            <div class="meta">可以试试清空搜索，或在左侧添加代理（节点请在“节点”页加入）。</div>
+          </td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const it of pageItems) {
+          const kind = itemKind(it);
+          const checkAt = ts(it.lastCheckAt);
+          const checkOk = !it.lastCheckAt
+            ? "—"
+            : it.lastCheckOk === true
+              ? "✅ OK"
+              : it.lastCheckOk === false
+                ? "❌ FAIL"
+                : "⚠️ MIXED";
+          const checkMs =
+            typeof it.lastCheckMs === "number" && Number.isFinite(it.lastCheckMs)
+              ? `${it.lastCheckMs}ms`
+              : "—";
+
+          const tr = document.createElement("tr");
+          if (kind === "node") {
+            const n = parseNodeBrief(it?.node);
+            const country = n.country || "其他";
+            const remark = n.remark || it.label || "（无备注）";
+            const hostPort = `${n.host || "—"}:${n.port || "—"}`;
+            const protocol = n.protocol || "node";
+            const checkType = it.lastCheckType ? String(it.lastCheckType).toUpperCase() : "—";
+            const checkDetail = it.lastCheckDetail || it.lastCheckError || "—";
+            tr.innerHTML = `
+              <td>
+                <div class="switch">
+                  <input class="hidden" type="checkbox" id="en_${esc(
+                    it.id,
+                  )}" data-enable="${esc(it.id)}" ${
+              it.enabled === false ? "" : "checked"
+            } />
+                  <label class="sw" for="en_${esc(it.id)}" aria-label="启用"></label>
+                </div>
+              </td>
+              <td>
+                <div class="row" style="align-items:flex-start">
+                  <span class="tag" title="节点">${esc(country)}</span>
+                  <div style="min-width:0">
+                    <div style="font-weight:650; line-height:1.2">${esc(remark)}</div>
+                    <div class="meta">
+                      <span class="mono">${esc(protocol)}</span>
+                      <span class="mono" style="margin-left:10px">${esc(hostPort)}</span>
+                    </div>
+                    <div class="meta">
+                      <span class="mono">添加</span> ${esc(ts(it.addedAt))}
+                      <span class="mono" style="margin-left:10px">使用</span> ${esc(
+                        ts(it.lastUsedAt),
+                      )}
+                    </div>
+                    <div class="meta">
+                      <span class="mono">检测</span> ${esc(checkAt)}
+                      <span class="mono" style="margin-left:10px">结果</span> ${esc(checkOk)}
+                      <span class="mono" style="margin-left:10px">类型</span> ${esc(checkType)}
+                      <span class="mono" style="margin-left:10px">耗时</span> ${esc(checkMs)}
+                      <span class="mono" style="margin-left:10px">详情</span> ${esc(checkDetail)}
+                    </div>
+                  </div>
+                </div>
+              </td>
+              <td>
+                <input class="input" data-label="${esc(
+                  it.id,
+                )}" placeholder="可选" value="${esc(it.label || "")}" />
+              </td>
+              <td>
+                <div class="row">
+                  <button class="btn sm" data-check="${esc(it.id)}">检测</button>
+                  <button class="btn sm" data-copy="${esc(n.fullLink || "")}">复制链接</button>
+                  <button class="btn sm danger" data-del="${esc(it.id)}">删除</button>
+                </div>
+              </td>
+            `;
+          } else {
+            const server = it?.proxy?.server || "";
+            const display = maskCred(server, it.proxy);
+            const checkDetail =
+              typeof it.lastCheckHttpStatus === "number" && Number.isFinite(it.lastCheckHttpStatus)
+                ? `HTTP ${it.lastCheckHttpStatus}`
+                : it.lastCheckError
+                  ? String(it.lastCheckError)
+                  : "—";
+            tr.innerHTML = `
+              <td>
+                <div class="switch">
+                  <input class="hidden" type="checkbox" id="en_${esc(
+                    it.id,
+                  )}" data-enable="${esc(it.id)}" ${
+              it.enabled === false ? "" : "checked"
+            } />
+                  <label class="sw" for="en_${esc(it.id)}" aria-label="启用"></label>
+                </div>
+              </td>
+              <td>
+                <span class="tag" title="${esc(display)}">${esc(display)}</span>
+                <div class="meta">
+                  <span class="mono">添加</span> ${esc(ts(it.addedAt))}
+                  <span class="mono" style="margin-left:10px">使用</span> ${esc(
+                        ts(it.lastUsedAt),
+                      )}
+                </div>
+                <div class="meta">
+                  <span class="mono">检测</span> ${esc(checkAt)}
+                  <span class="mono" style="margin-left:10px">结果</span> ${esc(checkOk)}
+                  <span class="mono" style="margin-left:10px">耗时</span> ${esc(checkMs)}
+                  <span class="mono" style="margin-left:10px">状态</span> ${esc(checkDetail)}
+                </div>
+              </td>
+              <td>
+                <input class="input" data-label="${esc(
+                  it.id,
+                )}" placeholder="可选" value="${esc(it.label || "")}" />
+              </td>
+              <td>
+                <div class="row">
+                  <button class="btn sm" data-check="${esc(it.id)}">检测</button>
+                  <button class="btn sm" data-copy="${esc(server)}">复制</button>
+                  <button class="btn sm danger" data-del="${esc(it.id)}">删除</button>
+                </div>
+              </td>
+            `;
+          }
+          tbody.appendChild(tr);
+        }
+      }
+
+      async function refresh() {
+        try {
+          const [health, store, pool] = await Promise.all([
+            j("/health"),
+            j("/v1/store"),
+            j("/v1/pool"),
+          ]);
+
+          $("led").className = "led good";
+          $("pillText").textContent = "正常";
+
+          state.storePath = store.storePath || "—";
+          $("storePath").textContent = state.storePath;
+
+          if (!checkInited) {
+            checkInited = true;
+            const poolCheck = store && store.poolCheck ? store.poolCheck : null;
+            const defaultUrl = poolCheck && poolCheck.url ? String(poolCheck.url) : "";
+            const defaultMethod = poolCheck && poolCheck.method ? String(poolCheck.method) : "HEAD";
+            try {
+              const savedUrl = localStorage.getItem("pool_check_url") || "";
+              const savedMethod = localStorage.getItem("pool_check_method") || "";
+              $("checkUrl").value = savedUrl || $("checkUrl").value || defaultUrl;
+              $("checkMethod").value = savedMethod || $("checkMethod").value || defaultMethod;
+            } catch {
+              $("checkUrl").value = $("checkUrl").value || defaultUrl;
+              $("checkMethod").value = $("checkMethod").value || defaultMethod;
+            }
+          }
+
+          const items = Array.isArray(pool.items) ? pool.items : [];
+          state.items = items;
+          pager?.reset();
+
+          const enabled = items.filter((x) => x.enabled !== false).length;
+          $("poolCount").textContent = String(items.length);
+          $("poolEnabled").textContent = String(enabled);
+
+          render();
+        } catch (err) {
+          $("led").className = "led bad";
+          $("pillText").textContent = "离线";
+          setStatus("bad", err.message || "刷新失败", { autoHideMs: 9000 });
+        }
+      }
+
+      async function addProxies() {
+        const text = $("txtAdd").value || "";
+        try {
+          setStatus("warn", "正在添加到代理池…", { autoHideMs: 0 });
+          const r = await j("/v1/pool", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          setStatus(
+            "good",
+            `完成：添加 ${r.added || 0}，跳过 ${r.skipped || 0}（重复）。`,
+          );
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "添加失败", { autoHideMs: 9000 });
+        }
+      }
+
+      async function fetchAndAdd() {
+        const url = String($("fetchUrl").value || "").trim();
+        const label = String($("fetchLabel").value || "").trim();
+        if (!url) return setStatus("warn", "请输入拉取 URL", { autoHideMs: 3500 });
+        try {
+          setStatus("warn", "正在拉取并解析…", { autoHideMs: 0 });
+          const r = await j("/v1/pool/fetch", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ url, label }),
+          });
+          setStatus(
+            "good",
+            `拉取完成：解析 ${r.parsed || 0}，新增 ${r.added || 0}，跳过 ${
+              r.skipped || 0
+            }（重复）。`,
+            { autoHideMs: 9000 },
+          );
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "拉取失败", { autoHideMs: 9000 });
+        }
+      }
+
+      async function setEnabled(id, enabled) {
+        await j(`/v1/pool/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+      }
+
+      async function checkProxy(id) {
+        const url = String($("checkUrl").value || "").trim();
+        const method = String($("checkMethod").value || "HEAD").trim().toUpperCase();
+        try {
+          try {
+            if (url) localStorage.setItem("pool_check_url", url);
+            if (method) localStorage.setItem("pool_check_method", method);
+          } catch {
+            // ignore
+          }
+          setStatus("warn", "正在检测…", { autoHideMs: 0 });
+          const r = await j(`/v1/pool/${encodeURIComponent(id)}/check`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ url, method }),
+          });
+          const s = r.success ? "good" : "bad";
+          const msg =
+            r.kind === "node"
+              ? r.success
+                ? `节点可达：${r.detail || "OK"} · ${r.ms}ms`
+                : `节点不可达：${r.error || r.detail || "FAIL"} · ${r.ms}ms`
+              : r.success
+                ? `检测通过：HTTP ${r.httpStatus} · ${r.ms}ms`
+                : `检测失败：${r.error || `HTTP ${r.httpStatus}`}`;
+          setStatus(s, msg, { autoHideMs: r.success ? 4500 : 9000 });
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "检测失败", { autoHideMs: 9000 });
+        }
+      }
+
+      async function setLabel(id, label) {
+        await j(`/v1/pool/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ label }),
+        });
+      }
+
+      async function delItem(id) {
+        await j(`/v1/pool/${encodeURIComponent(id)}`, { method: "DELETE" });
+      }
+
+      async function pickRandom() {
+        try {
+          const r = await j("/v1/pool/random");
+          if (!r.proxy && !r.node) {
+            setStatus("warn", "代理池没有可用项（请先添加并启用）", {
+              autoHideMs: 6500,
+            });
+            return;
+          }
+          if (r.proxy) {
+            setStatus(
+              "good",
+              `随机返回：${r.proxy.server}（编号：${r.item?.id || "—"}）`,
+              { autoHideMs: 8500 },
+            );
+          } else {
+            const n = parseNodeBrief(r.node);
+            const hostPort = `${n.host || "—"}:${n.port || "—"}`;
+            const remark = n.remark ? ` · ${n.remark}` : "";
+            setStatus(
+              "good",
+              `随机返回：节点 ${n.protocol || "node"} ${hostPort}${remark}（编号：${r.item?.id || "—"}）`,
+              { autoHideMs: 8500 },
+            );
+          }
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "随机测试失败", { autoHideMs: 8500 });
+        }
+      }
+
+      async function purgeDisabled() {
+        const disabled = state.items.filter((x) => x.enabled === false);
+        if (!disabled.length) {
+          setStatus("warn", "没有禁用项可清理", { autoHideMs: 2500 });
+          return;
+        }
+        try {
+          setStatus("warn", `正在清理 ${disabled.length} 个禁用项…`, {
+            autoHideMs: 0,
+          });
+          for (const it of disabled) {
+            // sequential is fine here; keeps API simple
+            await delItem(it.id);
+          }
+          setStatus("good", `已清理 ${disabled.length} 个禁用项`);
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "清理失败", { autoHideMs: 9000 });
+        }
+      }
+
+      $("btnRefresh").addEventListener("click", refresh);
+      $("btnPick").addEventListener("click", pickRandom);
+      $("btnAdd").addEventListener("click", addProxies);
+      $("btnFetch").addEventListener("click", fetchAndAdd);
+      $("btnClear").addEventListener("click", () => {
+        $("txtAdd").value = "";
+        setStatus("", "");
+      });
+      $("btnOnlyEnabled").addEventListener("click", () => {
+        state.onlyEnabled = !state.onlyEnabled;
+        $("btnOnlyEnabled").setAttribute("aria-pressed", String(state.onlyEnabled));
+        $("btnOnlyEnabled").textContent = state.onlyEnabled ? "只看启用 ✓" : "只看启用";
+        pager?.reset();
+        render();
+      });
+      $("btnPurgeDisabled").addEventListener("click", purgeDisabled);
+
+      $("btnLogout").addEventListener("click", async () => {
+        try {
+          await fetch("/auth/logout", { method: "POST" });
+        } catch {
+          // ignore
+        } finally {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+        }
+      });
+      $("search").addEventListener("input", () => {
+        pager?.reset();
+        render();
+      });
+
+      // Debounced label saves
+      let labelDebounce = null;
+      document.addEventListener("input", (e) => {
+        const lab = e.target.closest("input[data-label]");
+        if (!lab) return;
+        const id = lab.getAttribute("data-label");
+        const value = lab.value;
+        clearTimeout(labelDebounce);
+        labelDebounce = setTimeout(async () => {
+          try {
+            await setLabel(id, value);
+            setStatus("good", "已保存标签", { autoHideMs: 1200 });
+            await refresh();
+          } catch (err) {
+            setStatus("bad", err.message || "保存失败", { autoHideMs: 9000 });
+          }
+        }, 450);
+      });
+
+      document.addEventListener("change", async (e) => {
+        const en = e.target.closest("input[data-enable]");
+        if (!en) return;
+        const id = en.getAttribute("data-enable");
+        try {
+          await setEnabled(id, en.checked);
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "保存失败", { autoHideMs: 9000 });
+        }
+      });
+
+      document.addEventListener("click", async (e) => {
+        const del = e.target.closest("button[data-del]");
+        if (del) {
+          const id = del.getAttribute("data-del");
+          try {
+            await delItem(id);
+            setStatus("good", "已删除");
+            await refresh();
+          } catch (err) {
+            setStatus("bad", err.message || "删除失败", { autoHideMs: 9000 });
+          }
+          return;
+        }
+        const copy = e.target.closest("button[data-copy]");
+        if (copy) {
+          const text = copy.getAttribute("data-copy") || "";
+          try {
+            await navigator.clipboard.writeText(text);
+            setStatus("good", "已复制到剪贴板", { autoHideMs: 1200 });
+          } catch {
+            setStatus("warn", "无法访问剪贴板，请手动复制", { autoHideMs: 2500 });
+          }
+          return;
+        }
+        const chk = e.target.closest("button[data-check]");
+        if (chk) {
+          const id = chk.getAttribute("data-check");
+          await checkProxy(id);
+        }
+      });
+
+      window.addEventListener("DOMContentLoaded", () => {
+        pager = window.createPager({
+          sizeSel: $("pageSize"),
+          prevBtn: $("pagePrev"),
+          nextBtn: $("pageNext"),
+          infoEl: $("pageInfo"),
+          defaultPageSize: 15,
+          sizes: [10, 15, 20],
+          onChange: render,
+        });
+      });
+
+      // Use pageshow to handle bfcache (back/forward) after logout / cookie changes.
+      window.addEventListener("pageshow", () => {
+        pager?.reset();
+        refresh();
+      });
+    </script>
+  </body>
+</html>

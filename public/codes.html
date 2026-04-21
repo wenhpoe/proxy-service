@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>激活码 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/nav.js" defer></script>
+    <script src="/pager.js" defer></script>
+    <script src="/time.js" defer></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>激活码管理（代理服务）</h1>
+          <div class="sub">
+            生成激活码、查看使用状态与过期时间。激活码一次性：每个码只能兑换一次令牌；每台机器只能激活一次。
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnLogout">退出</button>
+          <div class="pill" title="服务状态">
+            <span class="led" id="led"></span>
+            <span class="mono" id="pillText">检查中…</span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid">
+        <section class="card" aria-label="生成激活码">
+          <div class="card-h">
+            <h2>生成</h2>
+            <div class="row"></div>
+          </div>
+          <div class="card-b">
+            <div class="cols2">
+              <div>
+                <label class="sub">数量</label>
+                <div style="height: 6px"></div>
+                <input class="input" id="codeCount" type="number" min="1" max="200" value="1" />
+              </div>
+              <div>
+                <label class="sub">有效期</label>
+                <div style="height: 6px"></div>
+                <select id="ttlSel"></select>
+              </div>
+            </div>
+            <div class="meta" style="margin-top: 8px">选择“不过期”会把 <span class="mono">expiresAt</span> 保存为 <span class="mono">null</span>。</div>
+            <div style="height: 12px"></div>
+            <label class="sub">生成结果</label>
+            <div style="height: 6px"></div>
+            <div class="tablebox" style="max-height: 300px">
+              <table>
+                <thead>
+                  <tr>
+                    <th>激活码</th>
+                  </tr>
+                </thead>
+                <tbody id="createdTbody"></tbody>
+              </table>
+            </div>
+            <div class="meta">只展示本次生成的激活码（便于复制）。完整列表在右侧。</div>
+            <div style="height: 10px"></div>
+            <div class="row">
+              <button class="btn primary" id="btnGen">生成</button>
+              <button class="btn" id="btnCopyCreated">复制本次生成</button>
+            </div>
+            <div class="status" id="statusGen" hidden></div>
+          </div>
+        </section>
+
+        <section class="card" aria-label="激活码列表">
+          <div class="card-h">
+            <h2>列表</h2>
+            <div class="row">
+              <input class="input" id="search" placeholder="搜索激活码 / 机器码…" style="width: 240px" />
+              <select id="pageSize" style="width: 110px"></select>
+              <button class="btn" id="pagePrev">上一页</button>
+              <button class="btn" id="pageNext">下一页</button>
+              <span class="chip"><span class="mono" id="pageInfo">—</span></span>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="sub">
+              状态：<span class="mono">未使用</span> / <span class="mono">已使用</span> / <span class="mono">已过期</span>
+            </div>
+            <div style="height: 10px"></div>
+            <div class="tablebox" style="max-height: 62vh">
+              <table>
+                <thead>
+                  <tr>
+                    <th>激活码</th>
+                    <th style="width: 180px">创建时间</th>
+                    <th style="width: 180px">过期时间</th>
+                    <th style="width: 120px">状态</th>
+                    <th style="width: 220px">使用机器码</th>
+                  </tr>
+                </thead>
+                <tbody id="codesTbody"></tbody>
+              </table>
+            </div>
+            <div class="status" id="statusList" hidden></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const state = {
+        codes: [],
+        created: [],
+      };
+
+      let pager = null;
+
+      function setStatus(elId, kind, text) {
+        const el = $(elId);
+        if (!text) {
+          el.hidden = true;
+          el.className = "status";
+          el.textContent = "";
+          return;
+        }
+        el.hidden = false;
+        el.className = `status ${kind || ""}`.trim();
+        el.textContent = text;
+      }
+
+      function esc(s) {
+        return String(s || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function ts(s) {
+        try {
+          return window.fmaFmtChinaTime ? window.fmaFmtChinaTime(s) : String(s || "—");
+        } catch {
+          return String(s || "—");
+        }
+      }
+
+      async function j(url, opts) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+          throw new Error("未登录");
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
+        return data;
+      }
+
+      async function refreshHealth() {
+        try {
+          await j("/health");
+          $("led").className = "led good";
+          $("pillText").textContent = "正常";
+        } catch {
+          $("led").className = "led bad";
+          $("pillText").textContent = "离线";
+        }
+      }
+
+      function isExpired(code) {
+        if (!code || !code.expiresAt) return false;
+        const t = Date.parse(code.expiresAt);
+        if (!Number.isFinite(t)) return false;
+        return t <= Date.now();
+      }
+
+      function statusOf(code) {
+        if (code.usedAt) return "已使用";
+        if (isExpired(code)) return "已过期";
+        return "未使用";
+      }
+
+      function renderCreated() {
+        const tbody = $("createdTbody");
+        tbody.innerHTML = "";
+        const list = Array.isArray(state.created) ? state.created : [];
+        if (!list.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td class="sub" style="padding:12px">暂无。</td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+        for (const c of list) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td class="mono">${esc(c.code)}</td>`;
+          tbody.appendChild(tr);
+        }
+      }
+
+      function renderList() {
+        const q = String($("search").value || "").trim().toLowerCase();
+        const tbody = $("codesTbody");
+        tbody.innerHTML = "";
+
+        const codes = Array.isArray(state.codes) ? state.codes : [];
+        const filtered = q
+          ? codes.filter((c) => {
+              const a = String(c.code || "").toLowerCase();
+              const b = String(c.usedByMachineId || "").toLowerCase();
+              return a.includes(q) || b.includes(q);
+            })
+          : codes;
+
+        const pageItems = pager ? pager.slice(filtered) : filtered;
+
+        if (!filtered.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="5" class="sub" style="padding:12px">暂无激活码（或搜索无结果）。</td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const c of pageItems) {
+          const st = statusOf(c);
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="mono">${esc(c.code)}</td>
+            <td class="mono">${esc(ts(c.createdAt))}</td>
+            <td class="mono">${esc(ts(c.expiresAt))}</td>
+            <td class="mono">${esc(st)}</td>
+            <td class="mono">${esc(c.usedByMachineId || "—")}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+      }
+
+      async function refreshCodes() {
+        try {
+          const r = await j("/v1/admin/codes");
+          state.codes = Array.isArray(r.codes) ? r.codes : [];
+          pager?.reset();
+          renderList();
+        } catch (e) {
+          setStatus("statusList", "bad", e.message || "刷新失败");
+        }
+      }
+
+      function initTtlSel() {
+        const opts = [
+          { label: "1 天", ttlSec: 86400 },
+          { label: "7 天", ttlSec: 86400 * 7 },
+          { label: "30 天", ttlSec: 86400 * 30 },
+          { label: "不过期", ttlSec: 0 },
+        ];
+        const sel = $("ttlSel");
+        sel.innerHTML = "";
+        for (const o of opts) {
+          const opt = document.createElement("option");
+          opt.value = o.ttlSec == null ? "" : String(o.ttlSec);
+          opt.textContent = o.label;
+          if (o.ttlSec === 86400) opt.selected = true;
+          sel.appendChild(opt);
+        }
+      }
+
+      async function genCodes() {
+        const count = Math.max(1, Math.min(200, Number($("codeCount").value || 1)));
+        const ttlRaw = String($("ttlSel").value || "");
+        const ttlSec = ttlRaw === "" ? null : Number(ttlRaw);
+        try {
+          setStatus("statusGen", "warn", "生成中…");
+          const payload = { count };
+          if (ttlSec != null && Number.isFinite(ttlSec)) payload.ttlSec = ttlSec;
+          const r = await j("/v1/admin/codes", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          state.created = Array.isArray(r.created) ? r.created : [];
+          renderCreated();
+          setStatus("statusGen", "good", `已生成 ${state.created.length} 个激活码`);
+          await refreshCodes();
+        } catch (e) {
+          setStatus("statusGen", "bad", e.message || "生成失败");
+        }
+      }
+
+      $("btnRefresh").addEventListener("click", async () => {
+        await Promise.all([refreshHealth(), refreshCodes()]);
+      });
+      $("btnGen").addEventListener("click", genCodes);
+      $("search").addEventListener("input", () => {
+        pager?.reset();
+        renderList();
+      });
+      $("btnCopyCreated").addEventListener("click", async () => {
+        const text = (state.created || []).map((c) => c.code).join("\n").trim();
+        if (!text) return setStatus("statusGen", "warn", "本次没有生成可复制的激活码");
+        try {
+          await navigator.clipboard.writeText(text);
+          setStatus("statusGen", "good", "已复制本次生成的激活码");
+        } catch {
+          setStatus("statusGen", "warn", "无法访问剪贴板，请手动复制");
+        }
+      });
+      $("btnLogout").addEventListener("click", async () => {
+        try {
+          await fetch("/auth/logout", { method: "POST" });
+        } catch {
+          // ignore
+        } finally {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+        }
+      });
+
+      window.addEventListener("DOMContentLoaded", () => {
+        initTtlSel();
+        pager = window.createPager({
+          sizeSel: $("pageSize"),
+          prevBtn: $("pagePrev"),
+          nextBtn: $("pageNext"),
+          infoEl: $("pageInfo"),
+          defaultPageSize: 15,
+          sizes: [10, 15, 20],
+          onChange: renderList,
+        });
+      });
+
+      window.addEventListener("pageshow", async () => {
+        pager?.reset();
+        await Promise.all([refreshHealth(), refreshCodes()]);
+      });
+    </script>
+  </body>
+</html>

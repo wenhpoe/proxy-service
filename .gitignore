@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Local storage (do not commit)
+data/
+accounts/
+
+# Secrets / runtime overrides
+.env
+build/bundled.env
+
+# Runtime artifacts
+runtime/
+tmp/
+

@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>账号仓库 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/nav.js" defer></script>
+    <script src="/pager.js" defer></script>
+    <script src="/time.js" defer></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>账号仓库（代理服务）</h1>
+          <div class="sub">
+            管理 <span class="mono">storageState</span> JSON：支持直接上传/导入，也支持“一键打开浏览器登录后保存”，用于给
+            <span class="mono">Flow 多账号管理器</span> 按机器码分发账号。
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnLogout">退出</button>
+          <div class="pill" title="服务状态">
+            <span class="led" id="led"></span>
+            <span class="mono" id="pillText">检查中…</span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid">
+        <section class="card">
+          <div class="card-h">
+            <h2>登录并保存账号</h2>
+            <div class="row"></div>
+          </div>
+          <div class="card-b">
+            <div class="hint">
+              点击“开始登录”会在管理员电脑上启动一个浏览器窗口并打开 Flow。你手动完成 Google 登录后，回到这里点“保存”即可写入账号 JSON。
+            </div>
+
+            <div style="height: 10px"></div>
+              <label class="sub">账号名称</label>
+            <div style="height: 6px"></div>
+            <input class="input mono" id="capProfile" placeholder="例如：269 / 账号A" />
+
+            <div style="height: 10px"></div>
+            <div class="row">
+              <button class="btn primary" id="btnCapStart">开始登录</button>
+              <button class="btn" id="btnCapSave" disabled>保存</button>
+              <button class="btn" id="btnCapCancel" disabled>取消</button>
+            </div>
+
+            <div class="status" id="statusCap" hidden></div>
+
+            <div style="height: 12px"></div>
+            <details>
+              <summary>高级：手动上传/更新 JSON</summary>
+              <div style="height: 10px"></div>
+              <label class="sub">账号名称（用于保存）</label>
+              <div style="height: 6px"></div>
+              <input class="input mono" id="accName" placeholder="账号名称（例如 269）" />
+              <div style="height: 10px"></div>
+              <textarea id="accJson" placeholder="在此粘贴账号登录态 JSON（storageState）"></textarea>
+              <div style="height: 10px"></div>
+              <div class="row">
+                <button class="btn primary" id="btnUpload">上传/更新</button>
+                <button class="btn danger" id="btnDeleteAcc">删除</button>
+                <input type="file" id="accFile" accept=".json,application/json" />
+              </div>
+              <div class="status" id="statusAcc" hidden></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-h">
+            <h2>账号列表</h2>
+            <div class="row">
+              <input class="input" id="search" placeholder="搜索账号…" style="width: 240px" />
+              <select id="pageSize" style="width: 110px"></select>
+              <button class="btn" id="pagePrev">上一页</button>
+              <button class="btn" id="pageNext">下一页</button>
+              <span class="chip"><span class="mono" id="pageInfo">—</span></span>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="sub">
+              服务端保存路径：<span class="tag" id="accountsDir">—</span>
+            </div>
+            <div style="height: 10px"></div>
+            <div class="tablebox" style="max-height: 62vh">
+              <table>
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th style="width: 180px">更新时间</th>
+                    <th style="width: 110px">大小</th>
+                    <th style="width: 250px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="accountsTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="card" style="grid-column: 1 / -1">
+          <div class="card-h">
+            <h2>账号代理策略（优先级）</h2>
+            <div class="row">
+              <button class="btn" id="btnPolicyRefresh">刷新代理池</button>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="hint">
+              为每个账号绑定多个 pool 代理/节点并按优先级选择，减少“同账号频繁更换 IP”的风险。<span class="mono">数字越小越优先</span>；
+              同优先级多条则随机；被自动检测关闭（enabled=false）的条目不会被选中。
+            </div>
+
+            <div style="height: 10px"></div>
+            <div class="row">
+              <input class="input mono" id="policyProfile" placeholder="账号名称（例如 269）" style="width: 220px" />
+              <button class="btn" id="btnPolicyLoad">加载</button>
+              <button class="btn primary" id="btnPolicySave" disabled>保存策略</button>
+              <button class="btn danger" id="btnPolicyClear" disabled>清除策略</button>
+              <span class="chip"><span class="mono" id="policyInfo">—</span></span>
+            </div>
+
+            <div class="status" id="statusPolicy" hidden></div>
+
+            <div style="height: 12px"></div>
+            <div class="cols2">
+              <div>
+                <div class="sub">代理池（可添加）</div>
+                <div style="height: 6px"></div>
+                <input class="input" id="policySearchPool" placeholder="搜索代理池…" />
+                <div style="height: 10px"></div>
+                <div class="tablebox" style="max-height: 46vh">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>条目</th>
+                        <th style="width: 90px">启用</th>
+                        <th style="width: 100px">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="policyPoolTbody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div>
+                <div class="sub">已绑定（按优先级生效）</div>
+                <div style="height: 6px"></div>
+                <input class="input" id="policySearchSel" placeholder="搜索已绑定…" />
+                <div style="height: 10px"></div>
+                <div class="tablebox" style="max-height: 46vh">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>条目</th>
+                        <th style="width: 120px">优先级</th>
+                        <th style="width: 100px">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="policySelTbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const state = {
+        profiles: [],
+        captureId: null,
+        poolItems: [],
+        policyLoadedFor: null,
+        selectedPolicyItems: [], // [{ poolItemId, priority }]
+      };
+
+      let pager = null;
+
+      function setStatus(elId, kind, text) {
+        const el = $(elId);
+        if (!text) {
+          el.hidden = true;
+          el.className = "status";
+          el.textContent = "";
+          return;
+        }
+        el.hidden = false;
+        el.className = `status ${kind || ""}`.trim();
+        el.textContent = text;
+      }
+
+      function esc(s) {
+        return String(s || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function ts(s) {
+        try {
+          return window.fmaFmtChinaTime ? window.fmaFmtChinaTime(s) : String(s || "—");
+        } catch {
+          return String(s || "—");
+        }
+      }
+
+      function maskCred(server, proxy) {
+        const s = String(server || "");
+        if (!proxy || typeof proxy !== "object") return s;
+        const hasUser = typeof proxy.username === "string" && proxy.username;
+        const hasPass = typeof proxy.password === "string" && proxy.password;
+        if (!hasUser && !hasPass) return s;
+        try {
+          const u = new URL(s);
+          u.username = hasUser ? "***" : "";
+          u.password = hasPass ? "***" : "";
+          return u.toString().replace(/\/$/, "");
+        } catch {
+          return s;
+        }
+      }
+
+      function briefPoolItem(it) {
+        const kind = it && it.node ? "node" : "proxy";
+        if (kind === "node") {
+          const n = it.node || {};
+          const remark = n.remark || n.title || it.label || "（无备注）";
+          const host = n.host || "—";
+          const port = n.port || "—";
+          const proto = n.protocol || "node";
+          const country = n.country || "其他";
+          return {
+            id: it.id,
+            kind,
+            enabled: it.enabled !== false,
+            label: `${country} · ${remark}`,
+            meta: `${proto} ${host}:${port}`,
+          };
+        }
+        const server = it?.proxy?.server || "";
+        return {
+          id: it.id,
+          kind,
+          enabled: it.enabled !== false,
+          label: maskCred(server, it.proxy),
+          meta: it.label ? String(it.label) : "proxy",
+        };
+      }
+
+      function matchText(q, text) {
+        const s = String(q || "").trim().toLowerCase();
+        if (!s) return true;
+        return String(text || "").toLowerCase().includes(s);
+      }
+
+      function renderPolicyInfo(extra) {
+        const name = String(state.policyLoadedFor || $("policyProfile")?.value || "").trim();
+        const n = state.selectedPolicyItems.length;
+        const base = name ? `${name} · ${n} 条` : "—";
+        $("policyInfo").textContent = extra ? `${base} · ${extra}` : base;
+        $("btnPolicySave").disabled = !name || n === 0;
+        $("btnPolicyClear").disabled = !name;
+      }
+
+      function renderPolicyPool() {
+        const tbody = $("policyPoolTbody");
+        tbody.innerHTML = "";
+        const q = String($("policySearchPool").value || "").trim().toLowerCase();
+        const selected = new Set(state.selectedPolicyItems.map((x) => x.poolItemId));
+
+        const items = Array.isArray(state.poolItems) ? state.poolItems : [];
+        const filtered = q
+          ? items.filter((it) => {
+              const b = briefPoolItem(it);
+              return (
+                matchText(q, b.label) ||
+                matchText(q, b.meta) ||
+                matchText(q, b.kind) ||
+                matchText(q, b.id)
+              );
+            })
+          : items;
+
+        if (!filtered.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="3" class="sub" style="padding:12px">代理池为空（或搜索无结果）。</td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const it of filtered) {
+          const b = briefPoolItem(it);
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>
+              <div style="font-weight:650">${esc(b.label)}</div>
+              <div class="meta">
+                <span class="mono">${esc(b.kind)}</span>
+                <span class="mono" style="margin-left:10px">${esc(b.meta)}</span>
+                <span class="mono" style="margin-left:10px">${esc(b.id)}</span>
+              </div>
+            </td>
+            <td class="mono">${b.enabled ? "✅" : "⛔️"}</td>
+            <td>
+              <button class="btn" data-policy-add="${esc(b.id)}" ${
+            selected.has(b.id) ? "disabled" : ""
+          }>添加</button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }
+      }
+
+      function renderPolicySelected() {
+        const tbody = $("policySelTbody");
+        tbody.innerHTML = "";
+        const q = String($("policySearchSel").value || "").trim().toLowerCase();
+        const items = Array.isArray(state.selectedPolicyItems) ? state.selectedPolicyItems : [];
+        const poolById = new Map((state.poolItems || []).map((x) => [x.id, x]));
+
+        const rows = items
+          .map((x) => {
+            const it = poolById.get(x.poolItemId) || null;
+            const b = it
+              ? briefPoolItem(it)
+              : { id: x.poolItemId, kind: "?", enabled: false, label: "（已不存在）", meta: "" };
+            return { ...x, brief: b };
+          })
+          .filter((x) => {
+            if (!q) return true;
+            const b = x.brief;
+            return (
+              matchText(q, b.label) ||
+              matchText(q, b.meta) ||
+              matchText(q, b.kind) ||
+              matchText(q, b.id) ||
+              matchText(q, String(x.priority))
+            );
+          })
+          .sort((a, b) => (a.priority || 0) - (b.priority || 0));
+
+        if (!rows.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="3" class="sub" style="padding:12px">暂无已绑定条目。</td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const r of rows) {
+          const b = r.brief;
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>
+              <div style="font-weight:650">${esc(b.label)}</div>
+              <div class="meta">
+                <span class="mono">${esc(b.kind)}</span>
+                <span class="mono" style="margin-left:10px">${esc(b.meta)}</span>
+                <span class="mono" style="margin-left:10px">${esc(b.id)}</span>
+              </div>
+            </td>
+            <td>
+              <input class="input mono" style="width:90px" data-policy-priority="${esc(
+                r.poolItemId,
+              )}" value="${esc(r.priority)}" />
+            </td>
+            <td>
+              <button class="btn danger" data-policy-del="${esc(r.poolItemId)}">移除</button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }
+      }
+
+      async function j(url, opts) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+          throw new Error("未登录");
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
+        return data;
+      }
+
+      async function refreshHealth() {
+        try {
+          await j("/health");
+          $("led").className = "led good";
+          $("pillText").textContent = "正常";
+        } catch {
+          $("led").className = "led bad";
+          $("pillText").textContent = "离线";
+        }
+      }
+
+      function renderAccounts() {
+        const q = String($("search").value || "").trim().toLowerCase();
+        const tbody = $("accountsTbody");
+        tbody.innerHTML = "";
+        const items = Array.isArray(state.profiles) ? state.profiles : [];
+        const filtered = q ? items.filter((p) => String(p.name || "").toLowerCase().includes(q)) : items;
+
+        const pageItems = pager ? pager.slice(filtered) : filtered;
+
+        if (!filtered.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="4" class="sub" style="padding:12px">暂无账号（或搜索无结果）。</td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const p of pageItems) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="mono">${esc(p.name)}</td>
+            <td class="mono">${esc(ts(p.updatedAt))}</td>
+            <td class="mono">${esc(p.size || 0)}</td>
+            <td>
+              <div class="row">
+                <button class="btn sm" data-fill="${esc(p.name)}">填入</button>
+                <button class="btn sm" data-policy="${esc(p.name)}">代理</button>
+                <button class="btn sm danger" data-del="${esc(p.name)}">删除</button>
+              </div>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }
+      }
+
+      async function listAccounts() {
+        const r = await j("/v1/admin/accounts");
+        $("accountsDir").textContent = r.accountsDir || "—";
+        state.profiles = Array.isArray(r.profiles) ? r.profiles : [];
+        pager?.reset();
+        renderAccounts();
+        return state.profiles;
+      }
+
+      async function refreshPoolItems() {
+        const r = await j("/v1/pool");
+        state.poolItems = Array.isArray(r.items) ? r.items : [];
+        renderPolicyPool();
+        renderPolicySelected();
+      }
+
+      async function loadPolicy(profileName) {
+        const name = String(profileName || $("policyProfile").value || "").trim();
+        if (!name) return setStatus("statusPolicy", "warn", "请输入账号名称");
+        $("policyProfile").value = name;
+        try {
+          setStatus("statusPolicy", "warn", "加载中…");
+          if (!state.poolItems.length) await refreshPoolItems();
+          const r = await j(`/v1/proxy-policy/${encodeURIComponent(name)}`);
+          const items = Array.isArray(r?.policy?.items) ? r.policy.items : [];
+          state.selectedPolicyItems = items
+            .map((x) => ({
+              poolItemId: String(x.poolItemId || "").trim(),
+              priority: typeof x.priority === "number" && Number.isFinite(x.priority) ? x.priority : 0,
+            }))
+            .filter((x) => x.poolItemId);
+          state.policyLoadedFor = name;
+          setStatus("statusPolicy", "good", `已加载：${name}`);
+          renderPolicyPool();
+          renderPolicySelected();
+          renderPolicyInfo(r?.policy?.updatedAt ? `策略 ${r.policy.updatedAt}` : null);
+        } catch (e) {
+          state.policyLoadedFor = name;
+          state.selectedPolicyItems = [];
+          renderPolicyPool();
+          renderPolicySelected();
+          renderPolicyInfo();
+          setStatus("statusPolicy", "bad", e.message || "加载失败");
+        }
+      }
+
+      async function savePolicy() {
+        const name = String($("policyProfile").value || "").trim();
+        if (!name) return setStatus("statusPolicy", "warn", "请输入账号名称");
+        const items = (state.selectedPolicyItems || [])
+          .map((x) => ({ poolItemId: String(x.poolItemId || "").trim(), priority: Number(x.priority) }))
+          .filter((x) => x.poolItemId);
+        if (!items.length) return setStatus("statusPolicy", "warn", "请至少添加 1 条");
+        try {
+          setStatus("statusPolicy", "warn", "保存中…");
+          await j(`/v1/proxy-policy/${encodeURIComponent(name)}`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ items }),
+          });
+          setStatus("statusPolicy", "good", `已保存：${name}`);
+          await loadPolicy(name);
+        } catch (e) {
+          setStatus("statusPolicy", "bad", e.message || "保存失败");
+        }
+      }
+
+      async function clearPolicy() {
+        const name = String($("policyProfile").value || "").trim();
+        if (!name) return setStatus("statusPolicy", "warn", "请输入账号名称");
+        try {
+          setStatus("statusPolicy", "warn", "清除中…");
+          await j(`/v1/proxy-policy/${encodeURIComponent(name)}`, { method: "DELETE" });
+          state.selectedPolicyItems = [];
+          state.policyLoadedFor = name;
+          renderPolicyPool();
+          renderPolicySelected();
+          renderPolicyInfo("已清除");
+          setStatus("statusPolicy", "good", `已清除：${name}`);
+        } catch (e) {
+          setStatus("statusPolicy", "bad", e.message || "清除失败");
+        }
+      }
+
+      async function uploadAccount() {
+        const name = String($("accName").value || "").trim();
+        const raw = String($("accJson").value || "").trim();
+        if (!name) return setStatus("statusAcc", "warn", "请输入账号名称");
+        if (!raw) return setStatus("statusAcc", "warn", "请输入账号登录态 JSON");
+        let json;
+        try {
+          json = JSON.parse(raw);
+        } catch {
+          return setStatus("statusAcc", "bad", "JSON 解析失败，请检查格式");
+        }
+        try {
+          setStatus("statusAcc", "warn", "上传中…");
+          await j(`/v1/admin/accounts/${encodeURIComponent(name)}`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ storageState: json }),
+          });
+          setStatus("statusAcc", "good", `已上传：${name}`);
+          await listAccounts();
+        } catch (e) {
+          setStatus("statusAcc", "bad", e.message || "上传失败");
+        }
+      }
+
+      async function deleteAccount(name) {
+        const n = String(name || $("accName").value || "").trim();
+        if (!n) return setStatus("statusAcc", "warn", "请输入账号名称");
+        try {
+          setStatus("statusAcc", "warn", "删除中…");
+          await j(`/v1/admin/accounts/${encodeURIComponent(n)}`, { method: "DELETE" });
+          setStatus("statusAcc", "good", `已删除：${n}`);
+          await listAccounts();
+        } catch (e) {
+          setStatus("statusAcc", "bad", e.message || "删除失败");
+        }
+      }
+
+      function setCaptureButtons(running) {
+        $("btnCapStart").disabled = running;
+        $("btnCapSave").disabled = !running;
+        $("btnCapCancel").disabled = !running;
+      }
+
+      async function capStart() {
+        const profile = String($("capProfile").value || "").trim();
+        if (!profile) return setStatus("statusCap", "warn", "请输入账号名称");
+        try {
+          setStatus("statusCap", "warn", "正在启动浏览器…");
+          const r = await j("/v1/admin/capture/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ profile }),
+          });
+          state.captureId = r.id;
+          setCaptureButtons(true);
+          setStatus(
+            "statusCap",
+            "good",
+            `浏览器已打开（浏览器通道：${r.channel || "?"}）。请在弹出的浏览器窗口里登录 Google，完成后回来点“保存”。`,
+          );
+        } catch (e) {
+          setStatus("statusCap", "bad", e.message || "启动失败");
+          state.captureId = null;
+          setCaptureButtons(false);
+        }
+      }
+
+      async function capSave() {
+        if (!state.captureId) return;
+        try {
+          setStatus("statusCap", "warn", "保存中…（会读取浏览器登录态并写入账号仓库）");
+          const r = await j(`/v1/admin/capture/finish/${encodeURIComponent(state.captureId)}`, { method: "POST" });
+          setStatus("statusCap", "good", `已保存：${r.profile}`);
+          state.captureId = null;
+          setCaptureButtons(false);
+          await listAccounts();
+        } catch (e) {
+          setStatus("statusCap", "bad", e.message || "保存失败");
+        }
+      }
+
+      async function capCancel() {
+        if (!state.captureId) return;
+        try {
+          await j(`/v1/admin/capture/cancel/${encodeURIComponent(state.captureId)}`, { method: "POST" });
+        } catch {
+          // ignore
+        } finally {
+          state.captureId = null;
+          setCaptureButtons(false);
+          setStatus("statusCap", "warn", "已取消（浏览器已关闭）");
+        }
+      }
+
+      $("btnRefresh").addEventListener("click", async () => {
+        try {
+          await Promise.all([refreshHealth(), listAccounts()]);
+        } catch (e) {
+          setStatus("statusAcc", "bad", e.message || "刷新失败");
+        }
+      });
+      $("btnLogout").addEventListener("click", async () => {
+        try {
+          await fetch("/auth/logout", { method: "POST" });
+        } catch {
+          // ignore
+        } finally {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+        }
+      });
+
+      $("search").addEventListener("input", () => {
+        pager?.reset();
+        renderAccounts();
+      });
+      $("btnUpload").addEventListener("click", uploadAccount);
+      $("btnDeleteAcc").addEventListener("click", () => deleteAccount());
+
+      $("accFile").addEventListener("change", async (e) => {
+        const f = e.target.files && e.target.files[0];
+        if (!f) return;
+        const text = await f.text();
+        $("accJson").value = text;
+      });
+
+      $("accountsTbody").addEventListener("click", async (e) => {
+        const fill = e.target.closest("[data-fill]");
+        const policy = e.target.closest("[data-policy]");
+        const del = e.target.closest("[data-del]");
+        if (fill) {
+          const name = fill.getAttribute("data-fill");
+          $("capProfile").value = name || "";
+          $("accName").value = name || "";
+          setStatus("statusCap", "good", "已填入账号名称，可直接开始登录或上传 JSON。");
+          return;
+        }
+        if (policy) {
+          const name = policy.getAttribute("data-policy");
+          await loadPolicy(name);
+          $("policyProfile").scrollIntoView({ behavior: "smooth", block: "center" });
+          return;
+        }
+        if (del) {
+          const name = del.getAttribute("data-del");
+          await deleteAccount(name);
+        }
+      });
+
+      $("policyPoolTbody").addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-policy-add]");
+        if (!btn) return;
+        const id = btn.getAttribute("data-policy-add");
+        if (!id) return;
+        if (state.selectedPolicyItems.some((x) => x.poolItemId === id)) return;
+        state.selectedPolicyItems.push({ poolItemId: id, priority: 0 });
+        renderPolicyPool();
+        renderPolicySelected();
+        renderPolicyInfo("未保存");
+      });
+
+      $("policySelTbody").addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-policy-del]");
+        if (!btn) return;
+        const id = btn.getAttribute("data-policy-del");
+        if (!id) return;
+        state.selectedPolicyItems = state.selectedPolicyItems.filter((x) => x.poolItemId !== id);
+        renderPolicyPool();
+        renderPolicySelected();
+        renderPolicyInfo("未保存");
+      });
+
+      $("policySelTbody").addEventListener("input", (e) => {
+        const input = e.target.closest("[data-policy-priority]");
+        if (!input) return;
+        const id = input.getAttribute("data-policy-priority");
+        if (!id) return;
+        const v = Number(String(input.value || "").trim());
+        const p = Number.isFinite(v) ? Math.min(999, Math.max(0, Math.floor(v))) : 0;
+        state.selectedPolicyItems = state.selectedPolicyItems.map((x) => (x.poolItemId === id ? { ...x, priority: p } : x));
+        renderPolicyInfo("未保存");
+      });
+
+      $("policySearchPool").addEventListener("input", () => renderPolicyPool());
+      $("policySearchSel").addEventListener("input", () => renderPolicySelected());
+      $("btnPolicyRefresh").addEventListener("click", async () => {
+        try {
+          setStatus("statusPolicy", "warn", "刷新中…");
+          await refreshPoolItems();
+          setStatus("statusPolicy", "good", "代理池已刷新");
+        } catch (e) {
+          setStatus("statusPolicy", "bad", e.message || "刷新失败");
+        }
+      });
+      $("btnPolicyLoad").addEventListener("click", async () => loadPolicy());
+      $("btnPolicySave").addEventListener("click", async () => savePolicy());
+      $("btnPolicyClear").addEventListener("click", async () => clearPolicy());
+
+      $("btnCapStart").addEventListener("click", capStart);
+      $("btnCapSave").addEventListener("click", capSave);
+      $("btnCapCancel").addEventListener("click", capCancel);
+
+      window.addEventListener("beforeunload", () => {
+        // Best-effort: do not auto-cancel (avoid accidental data loss).
+      });
+
+      // Use pageshow to handle bfcache (back/forward) after logout / cookie changes.
+      window.addEventListener("pageshow", async () => {
+        setCaptureButtons(false);
+        pager?.reset();
+        await Promise.all([refreshHealth(), listAccounts()]);
+        renderPolicyInfo();
+      });
+
+      window.addEventListener("DOMContentLoaded", () => {
+        pager = window.createPager({
+          sizeSel: $("pageSize"),
+          prevBtn: $("pagePrev"),
+          nextBtn: $("pageNext"),
+          infoEl: $("pageInfo"),
+          defaultPageSize: 15,
+          sizes: [10, 15, 20],
+          onChange: renderAccounts,
+        });
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,82 @@
+{
+  "name": "flow-proxy-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Flow 多账号管理器 - 代理管理服务（本地）",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:server": "node server.js",
+    "decode-sub": "node decode-sub.js",
+    "gen:icon": "node scripts/generate-icon.js",
+    "prepare:env": "node scripts/prepare-dist-env.js",
+    "dist": "npm run gen:icon && npm run prepare:env && electron-builder",
+    "dist:dir": "npm run gen:icon && npm run prepare:env && electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^31.4.0",
+    "electron-builder": "^24.13.3",
+    "pngjs": "^7.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "electron-updater": "^6.6.2",
+    "express": "^4.19.2",
+    "playwright-core": "^1.48.0",
+    "yaml": "^2.8.0"
+  },
+  "build": {
+    "appId": "com.internal.flow-proxy-service",
+    "productName": "Flow 代理管理服务",
+    "icon": "build/icon.png",
+    "compression": "maximum",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**",
+      "build/**",
+      "scripts/**",
+      "public/**",
+      "server.js",
+      "decode-sub.js",
+      "package.json",
+      "!dist/**",
+      "!data/**",
+      "!accounts/**",
+      "!**/*.map",
+      "!**/*.md",
+      "!**/.DS_Store"
+    ],
+    "asarUnpack": [
+      "build/**"
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "wenhpoe",
+        "repo": "proxy-service",
+        "releaseType": "release"
+      }
+    ]
+  }
+}

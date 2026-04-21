@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>节点 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/nav.js" defer></script>
+    <script src="/pager.js" defer></script>
+    <script src="/time.js" defer></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>节点管理（机场订阅）</h1>
+          <div class="sub">
+            通过订阅 URL 拉取并解析节点（当前支持 <span class="mono">vless://</span> /
+            <span class="mono">hysteria2://</span> / <span class="mono">vmess://</span>），并支持按国家筛选。<br />
+            注意：节点 ≠ Playwright 代理；“加入代理池”会以<strong>节点条目</strong>加入代理池，客户端将用 sing-box/Clash
+            落地为本地 <span class="mono">socks5://127.0.0.1:53182</span> 后再供 Playwright 使用（默认以禁用方式加入，避免立刻生效）。
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnLogout">退出</button>
+          <div class="pill" title="服务状态">
+            <span class="led" id="led"></span>
+            <span class="mono" id="pillText">检查中…</span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid">
+        <section class="card" aria-label="拉取订阅">
+          <div class="card-h">
+            <h2>拉取订阅</h2>
+          </div>
+          <div class="card-b">
+            <div class="hint">
+              填写机场订阅 URL（通常返回 Base64 文本或多行节点链接），服务端会解析后存入本地存储。<br />
+              建议先给本次拉取填写一个“来源标签”（例如：<span class="mono">主订阅</span> / <span class="mono">备用</span>）。
+            </div>
+
+            <div style="height: 10px"></div>
+            <input
+              class="input mono"
+              id="subUrl"
+              placeholder="https://example.com/sub?token=..."
+              autocomplete="off"
+            />
+            <div style="height: 10px"></div>
+            <div class="row">
+              <button class="btn primary" id="btnFetch">拉取并解析</button>
+              <input class="input" id="subLabel" placeholder="来源标签（可选）" style="max-width: 240px" />
+            </div>
+
+            <div style="height: 12px"></div>
+            <div class="hint">
+              也支持上传 Clash YAML 文件（从 <span class="mono">proxies:</span> 中提取）。当前仅导入
+              <span class="mono">vless</span> / <span class="mono">hysteria2</span> / <span class="mono">vmess</span>
+              ，其他类型会跳过并统计。
+            </div>
+            <div style="height: 10px"></div>
+            <div class="row">
+              <input id="subFile" type="file" accept=".yaml,.yml,.txt,application/x-yaml,text/yaml,text/plain" />
+              <button class="btn primary" id="btnImportFile">上传并解析</button>
+              <span class="chip"><span class="mono">文件</span> <strong id="subFileName">—</strong></span>
+            </div>
+
+            <div style="height: 12px"></div>
+            <div class="row">
+              <span class="chip"><span class="mono">存储</span> <strong id="storePath">—</strong></span>
+              <span class="chip"><span class="mono">节点</span> <strong id="nodeCount">0</strong></span>
+              <span class="chip"><span class="mono">启用</span> <strong id="nodeEnabled">0</strong></span>
+            </div>
+
+            <div class="status" id="status" role="status" aria-live="polite" hidden></div>
+
+            <div class="meta">
+              “加入代理池（节点·禁用）”：把该节点以“节点条目”加入代理池（不做 HTTP 代理转换），默认禁用；可在“代理池”页启用后生效。
+            </div>
+          </div>
+        </section>
+
+        <section class="card" aria-label="节点列表">
+          <div class="card-h">
+            <h2>节点列表</h2>
+            <div class="row">
+              <input class="input" id="search" placeholder="搜索（备注 / 地址 / 标签）" style="width: 240px" />
+              <select id="country" style="width: 150px"></select>
+              <button class="btn" id="btnOnlyEnabled" aria-pressed="false" title="只看启用">只看启用</button>
+              <input
+                class="input mono"
+                id="checkTimeout"
+                placeholder="超时ms"
+                style="width: 110px"
+                autocomplete="off"
+                title="检测超时（毫秒）。vless 默认 TCP 连接；hysteria2 默认 DNS 解析。"
+              />
+              <button class="btn" id="btnCheckAll" title="对当前筛选结果逐个检测">一键检测</button>
+              <select id="pageSize" style="width: 110px"></select>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="tablebox" style="max-height: 560px">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width: 84px">启用</th>
+                    <th>节点</th>
+                    <th style="width: 220px">标签</th>
+                    <th style="width: 280px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody"></tbody>
+              </table>
+            </div>
+
+            <div style="height: 10px"></div>
+            <div class="pager">
+              <button class="btn" id="pagePrev">上一页</button>
+              <button class="btn" id="pageNext">下一页</button>
+              <span class="chip" id="pageInfo">—</span>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      function esc(s) {
+        return String(s || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function ts(s) {
+        try {
+          return window.fmaFmtChinaTime ? window.fmaFmtChinaTime(s) : String(s || "—");
+        } catch {
+          return String(s || "—");
+        }
+      }
+
+      function setStatus(kind, msg, { autoHideMs = 2500 } = {}) {
+        const el = $("status");
+        if (!kind || !msg) {
+          el.hidden = true;
+          el.className = "status";
+          el.textContent = "";
+          return;
+        }
+        el.hidden = false;
+        el.className = `status ${kind}`;
+        el.textContent = msg;
+        clearTimeout(setStatus._t);
+        if (autoHideMs > 0) {
+          setStatus._t = setTimeout(() => setStatus("", ""), autoHideMs);
+        }
+      }
+
+      async function j(url, opts) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+          throw new Error("unauthorized");
+        }
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          const msg = data && data.error ? data.error : `HTTP ${res.status}`;
+          throw new Error(msg);
+        }
+        return data;
+      }
+
+      function maskUuid(uuid) {
+        const s = String(uuid || "");
+        if (!s) return "—";
+        if (s.length <= 10) return s;
+        return `${s.slice(0, 6)}…${s.slice(-4)}`;
+      }
+
+      function matchItem(it, q) {
+        if (!q) return true;
+        const s = String(q).trim().toLowerCase();
+        const a = String(it?.remark || "").toLowerCase();
+        const b = String(it?.host || "").toLowerCase();
+        const c = String(it?.label || "").toLowerCase();
+        const d = String(it?.country || "").toLowerCase();
+        const e = String(it?.protocol || "").toLowerCase();
+        return (
+          a.includes(s) ||
+          b.includes(s) ||
+          c.includes(s) ||
+          d.includes(s) ||
+          e.includes(s)
+        );
+      }
+
+      let state = {
+        items: [],
+        onlyEnabled: false,
+        storePath: "—",
+        countries: [],
+      };
+
+      let pager = null;
+      let checkInited = false;
+
+      function getFilteredItems() {
+        const q = $("search").value || "";
+        const country = $("country").value || "all";
+        return state.items
+          .filter((it) => (state.onlyEnabled ? it.enabled !== false : true))
+          .filter((it) => (country === "all" ? true : String(it.country || "") === country))
+          .filter((it) => matchItem(it, q));
+      }
+
+      function render() {
+        const tbody = $("tbody");
+        const filtered = getFilteredItems();
+        const pageItems = pager ? pager.slice(filtered) : filtered;
+
+        tbody.innerHTML = "";
+        if (!filtered.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="4" style="padding:14px">
+            <div class="sub">没有匹配项。</div>
+            <div class="meta">可以试试清空搜索或切换国家筛选。</div>
+          </td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const it of pageItems) {
+          const title = `${it.country || "其他"} · ${it.protocol || "?"} · ${it.host || "?"}:${it.port || "?"}`;
+          const remark = it.remark || it.label || "（无备注）";
+          const link = it.fullLink || "";
+          const copyLine = `${it.host || ""}:${it.port || ""}:${it.uuid || ""}:`;
+          const checkAt = ts(it.lastCheckAt);
+          const checkOk = !it.lastCheckAt
+            ? "—"
+            : it.lastCheckOk === true
+              ? "✅ OK"
+              : it.lastCheckOk === false
+                ? "❌ FAIL"
+                : "⚠️ MIXED";
+          const checkMs =
+            typeof it.lastCheckMs === "number" && Number.isFinite(it.lastCheckMs)
+              ? `${it.lastCheckMs}ms`
+              : "—";
+          const checkType = it.lastCheckType ? String(it.lastCheckType).toUpperCase() : "—";
+          const checkDetail = it.lastCheckDetail || it.lastCheckError || "—";
+          const protocol = it.protocol || "?";
+          const hostPort = `${it.host || "—"}:${it.port || "—"}`;
+          const country = it.country || "其他";
+          const uuidMasked = maskUuid(it.uuid);
+
+          let badgeClass = "";
+          if (it.lastCheckAt) {
+            if (it.lastCheckOk === true) badgeClass = "good";
+            else if (it.lastCheckOk === false) badgeClass = "bad";
+            else badgeClass = "warn";
+          }
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>
+              <div class="switch">
+                <input class="hidden" type="checkbox" id="en_${esc(
+                  it.id,
+                )}" data-enable="${esc(it.id)}" ${
+            it.enabled === false ? "" : "checked"
+          } />
+                <label class="sw" for="en_${esc(it.id)}" aria-label="启用"></label>
+              </div>
+            </td>
+            <td>
+              <div class="stack">
+                <div class="row" style="justify-content: space-between; align-items: flex-start; gap: 10px">
+                  <div style="min-width: 0">
+                    <div style="font-weight: 650; line-height: 1.2; word-break: break-word">${esc(
+                      remark,
+                    )}</div>
+                    <div class="meta">
+                      <span class="badge mono" title="${esc(title)}">${esc(country)}</span>
+                      <span class="badge mono" style="margin-left: 6px">${esc(protocol)}</span>
+                      <span class="badge mono" style="margin-left: 6px">${esc(hostPort)}</span>
+                      <span class="badge mono" style="margin-left: 6px" title="${esc(it.uuid || "")}">uuid ${esc(
+                        uuidMasked,
+                      )}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="kvmini">
+                  <div class="k mono">来源</div>
+                  <div class="v">${esc(it.sourceLabel || "—")}</div>
+                  <div class="k mono">更新</div>
+                  <div class="v mono">${esc(ts(it.updatedAt))}</div>
+                </div>
+
+                <div class="kvmini">
+                  <div class="k mono">检测</div>
+                  <div class="v mono">${esc(checkAt)}</div>
+                  <div class="k mono">结果</div>
+                  <div class="v">
+                    <span class="badge ${esc(badgeClass)}">${esc(checkOk)}</span>
+                    <span class="mono" style="margin-left: 8px">类型</span>
+                    <span class="mono">${esc(checkType)}</span>
+                    <span class="mono" style="margin-left: 8px">耗时</span>
+                    <span class="mono">${esc(checkMs)}</span>
+                  </div>
+                  <div class="k mono">详情</div>
+                  <div class="v">${esc(checkDetail)}</div>
+                </div>
+              </div>
+            </td>
+            <td>
+              <input class="input" data-label="${esc(
+                it.id,
+              )}" placeholder="可选" value="${esc(it.label || "")}" />
+            </td>
+            <td>
+              <div class="actions">
+                <button class="btn sm" data-check="${esc(it.id)}">检测</button>
+                <button class="btn sm" data-to-pool="${esc(it.id)}" title="以禁用方式加入代理池（节点条目）">
+                  加入代理池（节点·禁用）
+                </button>
+                <button class="btn sm" data-copy="${esc(link)}">复制链接</button>
+                <button class="btn sm" data-copy="${esc(copyLine)}">复制行</button>
+                <button class="btn sm danger" data-del="${esc(it.id)}">删除</button>
+              </div>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }
+      }
+
+      function fillCountryOptions(countries, selected) {
+        const sel = $("country");
+        const cur = selected || sel.value || "all";
+        const opts = ["all", ...(countries || [])];
+        sel.innerHTML = "";
+        for (const c of opts) {
+          const opt = document.createElement("option");
+          opt.value = c;
+          opt.textContent = c === "all" ? "全部国家" : c;
+          if (c === cur) opt.selected = true;
+          sel.appendChild(opt);
+        }
+      }
+
+      async function refresh() {
+        try {
+          const [health, store, nodes] = await Promise.all([
+            j("/health"),
+            j("/v1/store"),
+            j("/v1/nodes"),
+          ]);
+
+          $("led").className = "led good";
+          $("pillText").textContent = "正常";
+
+          state.storePath = store.storePath || "—";
+          $("storePath").textContent = state.storePath;
+
+          if (!checkInited) {
+            checkInited = true;
+            const nodeCheck = store && store.nodeCheck ? store.nodeCheck : null;
+            const defaultTimeout =
+              nodeCheck && typeof nodeCheck.timeoutMs === "number" ? String(nodeCheck.timeoutMs) : "3500";
+            try {
+              const saved = localStorage.getItem("nodes_check_timeout_ms") || "";
+              $("checkTimeout").value = saved || $("checkTimeout").value || defaultTimeout;
+            } catch {
+              $("checkTimeout").value = $("checkTimeout").value || defaultTimeout;
+            }
+          }
+
+          const items = Array.isArray(nodes.items) ? nodes.items : [];
+          state.items = items;
+          pager?.reset();
+
+          const enabled = items.filter((x) => x.enabled !== false).length;
+          $("nodeCount").textContent = String(items.length);
+          $("nodeEnabled").textContent = String(enabled);
+
+          const countries = Array.from(
+            new Set(items.map((x) => String(x.country || "其他")).filter(Boolean)),
+          ).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+          state.countries = countries;
+          fillCountryOptions(countries);
+
+          render();
+        } catch (err) {
+          $("led").className = "led bad";
+          $("pillText").textContent = "离线";
+          setStatus("bad", err.message || "刷新失败", { autoHideMs: 9000 });
+        }
+      }
+
+      async function fetchNodes() {
+        const url = String($("subUrl").value || "").trim();
+        const label = String($("subLabel").value || "").trim();
+        if (!url) return setStatus("warn", "请输入订阅 URL", { autoHideMs: 3500 });
+        try {
+          setStatus("warn", "正在拉取并解析…", { autoHideMs: 0 });
+          const r = await j("/v1/nodes/fetch", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ url, label }),
+          });
+          setStatus(
+            "good",
+            `拉取完成：解析 ${r.parsed || 0}，新增 ${r.added || 0}，更新 ${
+              r.updated || 0
+            }。`,
+            { autoHideMs: 9000 },
+          );
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "拉取失败", { autoHideMs: 9000 });
+        }
+      }
+
+      async function importFile() {
+        const input = $("subFile");
+        const file = input && input.files && input.files[0] ? input.files[0] : null;
+        if (!file) return setStatus("warn", "请选择要上传的 YAML 文件", { autoHideMs: 3500 });
+        const label = String($("subLabel").value || "").trim();
+
+        $("btnImportFile").disabled = true;
+        const original = $("btnImportFile").textContent;
+        $("btnImportFile").textContent = "解析中…";
+        try {
+          setStatus("warn", "正在解析文件…", { autoHideMs: 0 });
+          const content = await file.text();
+          const r = await j("/v1/nodes/import", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ content, filename: file.name || "", label }),
+          });
+
+          const skipped = typeof r.skipped === "number" ? r.skipped : 0;
+          const total = typeof r.totalProxies === "number" ? r.totalProxies : null;
+          const extra =
+            total != null ? `（YAML proxies ${total}，跳过 ${skipped}）` : skipped ? `（跳过 ${skipped}）` : "";
+          setStatus(
+            "good",
+            `导入完成：解析 ${r.parsed || 0}，新增 ${r.added || 0}，更新 ${r.updated || 0} ${extra}`.trim(),
+            { autoHideMs: 9000 },
+          );
+          await refresh();
+        } catch (e) {
+          setStatus("bad", e.message || "导入失败", { autoHideMs: 9000 });
+        } finally {
+          $("btnImportFile").disabled = false;
+          $("btnImportFile").textContent = original;
+        }
+      }
+
+      async function setEnabled(id, enabled) {
+        await j(`/v1/nodes/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+      }
+
+      async function setLabel(id, label) {
+        await j(`/v1/nodes/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ label }),
+        });
+      }
+
+      async function delItem(id) {
+        await j(`/v1/nodes/${encodeURIComponent(id)}`, { method: "DELETE" });
+      }
+
+      async function toPool(id) {
+        return j(`/v1/nodes/${encodeURIComponent(id)}/to-pool`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled: false }),
+        });
+      }
+
+      function getCheckTimeoutMs() {
+        const raw = String($("checkTimeout").value || "").trim();
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        return Math.min(60000, Math.max(500, Math.floor(n)));
+      }
+
+      async function checkNode(id, { quiet = false } = {}) {
+        const timeoutMs = getCheckTimeoutMs();
+        if (!quiet) setStatus("warn", "正在检测节点…", { autoHideMs: 0 });
+        try {
+          if (timeoutMs != null) {
+            try {
+              localStorage.setItem("nodes_check_timeout_ms", String(timeoutMs));
+            } catch {
+              // ignore
+            }
+          }
+          const r = await j(`/v1/nodes/${encodeURIComponent(id)}/check`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ timeoutMs }),
+          });
+          const idx = state.items.findIndex((x) => x && x.id === id);
+          if (idx >= 0 && r.item) state.items[idx] = r.item;
+          render();
+          if (!quiet) {
+            const msg = r.success
+              ? `检测通过：${r.detail || "OK"} · ${r.ms}ms`
+              : `检测失败：${r.error || "FAIL"} · ${r.ms}ms`;
+            setStatus(r.success ? "good" : "bad", msg, { autoHideMs: r.success ? 4500 : 9000 });
+          }
+          return r;
+        } catch (err) {
+          if (!quiet) setStatus("bad", err.message || "检测失败", { autoHideMs: 9000 });
+          throw err;
+        }
+      }
+
+      async function checkAll() {
+        const list = getFilteredItems();
+        if (!list.length) return setStatus("warn", "没有可检测的节点", { autoHideMs: 2500 });
+
+        const btn = $("btnCheckAll");
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = "检测中…";
+
+        let ok = 0;
+        let fail = 0;
+        try {
+          setStatus("warn", `正在检测 0/${list.length}…`, { autoHideMs: 0 });
+          for (let i = 0; i < list.length; i++) {
+            const id = list[i].id;
+            try {
+              const r = await checkNode(id, { quiet: true });
+              if (r && r.success) ok += 1;
+              else fail += 1;
+            } catch {
+              fail += 1;
+            }
+            setStatus("warn", `正在检测 ${i + 1}/${list.length}（成功 ${ok} / 失败 ${fail}）…`, {
+              autoHideMs: 0,
+            });
+          }
+          setStatus(fail ? "warn" : "good", `检测完成：成功 ${ok}，失败 ${fail}`, { autoHideMs: 9000 });
+          await refresh();
+        } finally {
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      }
+
+      $("btnRefresh").addEventListener("click", refresh);
+      $("btnFetch").addEventListener("click", fetchNodes);
+      $("btnImportFile").addEventListener("click", importFile);
+      $("subFile").addEventListener("change", () => {
+        const f = $("subFile").files && $("subFile").files[0] ? $("subFile").files[0] : null;
+        $("subFileName").textContent = f ? f.name : "—";
+      });
+      $("btnCheckAll").addEventListener("click", checkAll);
+      $("btnOnlyEnabled").addEventListener("click", () => {
+        state.onlyEnabled = !state.onlyEnabled;
+        $("btnOnlyEnabled").setAttribute("aria-pressed", String(state.onlyEnabled));
+        $("btnOnlyEnabled").textContent = state.onlyEnabled ? "只看启用 ✓" : "只看启用";
+        pager?.reset();
+        render();
+      });
+
+      $("btnLogout").addEventListener("click", async () => {
+        try {
+          await fetch("/auth/logout", { method: "POST" });
+        } catch {
+          // ignore
+        } finally {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+        }
+      });
+
+      $("search").addEventListener("input", () => {
+        pager?.reset();
+        render();
+      });
+      $("country").addEventListener("change", () => {
+        pager?.reset();
+        render();
+      });
+
+      // Debounced label saves
+      let labelDebounce = null;
+      document.addEventListener("input", (e) => {
+        const lab = e.target.closest("input[data-label]");
+        if (!lab) return;
+        const id = lab.getAttribute("data-label");
+        const value = lab.value;
+        clearTimeout(labelDebounce);
+        labelDebounce = setTimeout(async () => {
+          try {
+            await setLabel(id, value);
+            setStatus("good", "已保存标签", { autoHideMs: 1200 });
+            await refresh();
+          } catch (err) {
+            setStatus("bad", err.message || "保存失败", { autoHideMs: 9000 });
+          }
+        }, 450);
+      });
+
+      document.addEventListener("change", async (e) => {
+        const en = e.target.closest("input[data-enable]");
+        if (!en) return;
+        const id = en.getAttribute("data-enable");
+        try {
+          await setEnabled(id, en.checked);
+          await refresh();
+        } catch (err) {
+          setStatus("bad", err.message || "保存失败", { autoHideMs: 9000 });
+        }
+      });
+
+      document.addEventListener("click", async (e) => {
+        const del = e.target.closest("button[data-del]");
+        if (del) {
+          const id = del.getAttribute("data-del");
+          try {
+            await delItem(id);
+            setStatus("good", "已删除");
+            await refresh();
+          } catch (err) {
+            setStatus("bad", err.message || "删除失败", { autoHideMs: 9000 });
+          }
+          return;
+        }
+        const copy = e.target.closest("button[data-copy]");
+        if (copy) {
+          const text = copy.getAttribute("data-copy") || "";
+          try {
+            await navigator.clipboard.writeText(text);
+            setStatus("good", "已复制到剪贴板", { autoHideMs: 1200 });
+          } catch {
+            setStatus("warn", "无法访问剪贴板，请手动复制", { autoHideMs: 2500 });
+          }
+          return;
+        }
+        const tp = e.target.closest("button[data-to-pool]");
+        if (tp) {
+          const id = tp.getAttribute("data-to-pool");
+          try {
+            const r = await toPool(id);
+            if (r.added) setStatus("good", "已加入代理池（节点·禁用）", { autoHideMs: 2500 });
+            else setStatus("warn", "代理池已存在重复项（已跳过）", { autoHideMs: 3500 });
+            await refresh();
+          } catch (err) {
+            setStatus("bad", err.message || "加入失败", { autoHideMs: 9000 });
+          }
+          return;
+        }
+        const chk = e.target.closest("button[data-check]");
+        if (chk) {
+          const id = chk.getAttribute("data-check");
+          await checkNode(id);
+        }
+      });
+
+      window.addEventListener("DOMContentLoaded", () => {
+        pager = window.createPager({
+          sizeSel: $("pageSize"),
+          prevBtn: $("pagePrev"),
+          nextBtn: $("pageNext"),
+          infoEl: $("pageInfo"),
+          defaultPageSize: 15,
+          sizes: [10, 15, 20],
+          onChange: render,
+        });
+      });
+
+      window.addEventListener("pageshow", () => {
+        pager?.reset();
+        refresh();
+      });
+    </script>
+  </body>
+</html>

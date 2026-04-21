@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>代理服务 · 管理员登录</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>代理服务 · 管理员登录</h1>
+          <div class="sub">
+            请输入管理员密码后进入代理池与设备管理页面。该密码只在管理员内网使用。
+          </div>
+        </div>
+        <div class="top-actions">
+          <div class="pill" title="服务状态">
+            <span class="led" id="led"></span>
+            <span class="mono" id="pillText">检查中…</span>
+          </div>
+        </div>
+      </header>
+
+      <main style="display: grid; place-items: center; margin-top: 14px">
+        <section class="card" style="width: min(520px, 100%)">
+          <div class="card-h">
+            <h2>管理员登录</h2>
+            <div class="row">
+              <button class="btn" id="btnGoHome" type="button">返回首页</button>
+            </div>
+          </div>
+          <div class="card-b">
+            <label class="sub" for="pwd">密码</label>
+            <div style="height: 6px"></div>
+            <input class="input" id="pwd" type="password" placeholder="请输入管理员密码" autocomplete="current-password" />
+            <div style="height: 10px"></div>
+            <div class="row">
+              <button class="btn primary" id="btnLogin" type="button">登录</button>
+              <button class="btn" id="btnClear" type="button">清空</button>
+            </div>
+            <div class="status" id="status" role="status" aria-live="polite" hidden></div>
+            <div class="status warn" id="configHint" role="status" aria-live="polite" hidden></div>
+            <div class="meta">
+              登录成功后会写入浏览器会话（<span class="mono">HttpOnly</span>）；关闭浏览器或过期后需重新登录。
+              <br />
+              注意：这里输入的是<strong>管理员密码</strong>，不是“激活码”。
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      function qp(name) {
+        const u = new URL(location.href);
+        return u.searchParams.get(name);
+      }
+
+      function setStatus(kind, text) {
+        const el = $("status");
+        if (!text) {
+          el.hidden = true;
+          el.className = "status";
+          el.textContent = "";
+          return;
+        }
+        el.hidden = false;
+        el.className = `status ${kind || ""}`.trim();
+        el.textContent = text;
+      }
+
+      async function j(url, opts) {
+        const res = await fetch(url, opts);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
+        return data;
+      }
+
+      async function refreshHealth() {
+        try {
+          const h = await j("/health");
+          $("led").className = "led good";
+          $("pillText").textContent = "正常";
+          const hint = $("configHint");
+          if (hint) {
+            const src = String(h?.adminPasswordSource || "");
+            if (src === "generated") {
+              hint.hidden = false;
+              hint.className = "status warn";
+              hint.textContent = `管理员密码未配置：请在配置文件中设置 PROXY_ADMIN_PASSWORD 后重启。配置文件：${h?.envHint || "（未知）"}`;
+            } else {
+              hint.hidden = true;
+              hint.textContent = "";
+            }
+          }
+        } catch {
+          $("led").className = "led bad";
+          $("pillText").textContent = "离线";
+          const hint = $("configHint");
+          if (hint) hint.hidden = true;
+        }
+      }
+
+      async function login() {
+        const password = String($("pwd").value || "").trim();
+        if (!password) return setStatus("warn", "请输入密码");
+        try {
+          setStatus("warn", "登录中…");
+          await j("/auth/login", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ password }),
+          });
+          setStatus("good", "登录成功，正在跳转…");
+          const next = qp("next") || "/";
+          location.href = next;
+        } catch (e) {
+          setStatus("bad", e.message || "登录失败");
+        }
+      }
+
+      $("btnLogin").addEventListener("click", login);
+      $("btnClear").addEventListener("click", () => {
+        $("pwd").value = "";
+        setStatus("", "");
+      });
+      $("btnGoHome").addEventListener("click", () => (location.href = "/"));
+
+      $("pwd").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") login();
+      });
+
+      window.addEventListener("load", () => {
+        refreshHealth();
+        $("pwd").focus();
+      });
+    </script>
+  </body>
+</html>
