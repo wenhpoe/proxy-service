@@ -1,0 +1,61 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install
+        run: npm ci
+
+      - name: Verify tag matches version
+        shell: bash
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG="${GITHUB_REF_NAME}"
+          if [ "v${PKG_VERSION}" != "${TAG}" ]; then
+            echo "❌ tag (${TAG}) != package.json version (${PKG_VERSION})"
+            exit 1
+          fi
+
+      - name: Write .env (optional, for bundled admin password)
+        shell: bash
+        env:
+          PROXY_ADMIN_PASSWORD: ${{ secrets.PROXY_ADMIN_PASSWORD }}
+        run: |
+          if [ -n "${PROXY_ADMIN_PASSWORD}" ]; then
+            echo "PROXY_ADMIN_PASSWORD=${PROXY_ADMIN_PASSWORD}" > .env
+            echo "✅ wrote .env for bundling"
+          else
+            echo "ℹ️ PROXY_ADMIN_PASSWORD not set; packaged app will auto-generate on first start"
+          fi
+
+      - name: Build and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist -- --publish always
+
