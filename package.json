@@ -29,6 +29,7 @@
     "appId": "com.internal.flow-proxy-service",
     "productName": "Flow 代理管理服务",
     "icon": "build/icon.png",
+    "artifactName": "${name}-${version}-${os}-${arch}.${ext}",
     "compression": "maximum",
     "asar": true,
     "directories": {
