@@ -19,6 +19,30 @@
 - `permissions: contents: write`（允许上传 Release 资产）
 - 使用内置 `secrets.GITHUB_TOKEN` 发布（无需你手动配置 token）
 
+### 0.2 macOS 代码签名（强烈推荐）
+
+macOS 的自动更新（Squirrel.Mac / ShipIt）会校验 **新版本必须满足旧版本的 code requirement**。
+
+- 如果你发布的是「未签名 / ad-hoc 签名」的 app，旧版本的 requirement 往往会退化为 **cdhash**，导致后续任何新版本都无法通过校验（表现为 `code failed to satisfy specified code requirement(s)`）。
+- 解决办法：从某个版本开始，所有 macOS 产物都用同一份证书签名（推荐 **Developer ID Application**），并让用户 **手动安装一次** 这个“已签名版本”，之后自动更新才能稳定工作。
+
+本项目的 GitHub Actions 已支持可选签名：配置 Secrets 后，`macos-latest` job 会自动导入证书并完成签名。
+
+需要在 GitHub 仓库配置两个 Actions Secrets：
+
+- `MAC_CSC_P12_BASE64`：`.p12` 证书（包含私钥）的 base64 字符串
+- `MAC_CSC_P12_PASSWORD`：导出 `.p12` 时设置的密码
+
+生成 `MAC_CSC_P12_BASE64`（示例命令）：
+
+```bash
+# 先在 Keychain Access 导出 Developer ID Application 为 signing-cert.p12
+base64 -i signing-cert.p12 | pbcopy
+```
+
+然后粘贴到 GitHub：
+`Settings` → `Secrets and variables` → `Actions` → `New repository secret`。
+
 ### 0.2 （可选）设置默认管理员密码（推荐）
 
 `proxy-service` 打包时支持把 `.env` 打进安装包（用于默认管理员密码）。
@@ -180,6 +204,21 @@ macOS 的自动更新依赖 `latest-mac.yml` + `.zip`（由构建流程自动上
 - 公证（notarize）
 
 否则有概率在「更新后」被 Gatekeeper 阻止运行。
+
+### 4.4 为什么 macOS 自动更新下载后失败（code requirement）？
+
+如果你在更新日志里看到类似：
+
+- `code failed to satisfy specified code requirement(s)`
+
+这通常意味着：你当前安装的旧版本是「未签名 / ad-hoc」，ShipIt 校验要求新版本满足旧版本的 cdhash requirement，导致无法更新。
+
+处理方式：
+
+1) 先按「0.2 macOS 代码签名」配置签名证书  
+2) 发布一个新版本（tag）  
+3) 在你的机器上 **手动下载并安装** 这个“已签名版本”（覆盖 `/Applications`）  
+4) 之后的版本将可正常自动更新
 
 ---
 
