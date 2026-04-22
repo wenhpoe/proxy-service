@@ -293,6 +293,20 @@
       let pager = null;
       let checkInited = false;
 
+      function clampTableScroll() {
+        const box = document.querySelector(".tablebox");
+        if (!box) return;
+        requestAnimationFrame(() => {
+          try {
+            const max = Math.max(0, box.scrollHeight - box.clientHeight);
+            if (box.scrollTop > max) box.scrollTop = max;
+            if (box.scrollTop < 0) box.scrollTop = 0;
+          } catch {
+            // ignore
+          }
+        });
+      }
+
       function getFilteredItems() {
         const q = $("search").value || "";
         return state.items
@@ -314,6 +328,7 @@
             <div class="meta">可以试试清空搜索，或在左侧添加代理（节点请在“节点”页加入）。</div>
           </td>`;
           tbody.appendChild(tr);
+          clampTableScroll();
           return;
         }
 
@@ -441,6 +456,7 @@
           }
           tbody.appendChild(tr);
         }
+        clampTableScroll();
       }
 
       function upsertItem(updated) {
