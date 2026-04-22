@@ -107,6 +107,7 @@
             <div class="toolbar">
               <div class="sub">
                 勾选启用开关即刻生效；标签会自动保存。点击“复制”：代理条目复制地址（不含密码），节点条目复制分享链接（包含 uuid/密码）。
+                <span class="mono">自动检测</span>：仅代理池内的<span class="mono">节点</span>会后台每 3 分钟 ×3 次检测，稳定后自动启用/禁用。
               </div>
               <div class="row" style="justify-content: space-between; flex-wrap: wrap">
                 <div class="row">
@@ -122,7 +123,10 @@
                     <option value="GET">GET</option>
                   </select>
                 </div>
-                <button class="btn danger" id="btnPurgeDisabled" title="删除所有禁用项">清理禁用</button>
+                <div class="row">
+                  <button class="btn" id="btnCheckAll" title="按当前筛选逐个检测">一键检测</button>
+                  <button class="btn danger" id="btnPurgeDisabled" title="删除所有禁用项">清理禁用</button>
+                </div>
               </div>
             </div>
             <div style="height: 10px"></div>
@@ -289,12 +293,16 @@
       let pager = null;
       let checkInited = false;
 
-      function render() {
-        const tbody = $("tbody");
+      function getFilteredItems() {
         const q = $("search").value || "";
-        const filtered = state.items
+        return state.items
           .filter((it) => (state.onlyEnabled ? it.enabled !== false : true))
           .filter((it) => matchItem(it, q));
+      }
+
+      function render() {
+        const tbody = $("tbody");
+        const filtered = getFilteredItems();
 
         const pageItems = pager ? pager.slice(filtered) : filtered;
 
@@ -435,6 +443,15 @@
         }
       }
 
+      function upsertItem(updated) {
+        if (!updated || typeof updated !== "object") return;
+        const id = String(updated.id || "").trim();
+        if (!id) return;
+        const idx = state.items.findIndex((x) => x && x.id === id);
+        if (idx >= 0) state.items[idx] = updated;
+        else state.items.push(updated);
+      }
+
       async function refresh() {
         try {
           const [health, store, pool] = await Promise.all([
@@ -532,7 +549,7 @@
         });
       }
 
-      async function checkProxy(id) {
+      async function checkProxy(id, { silent = false } = {}) {
         const url = String($("checkUrl").value || "").trim();
         const method = String($("checkMethod").value || "HEAD").trim().toUpperCase();
         try {
@@ -542,12 +559,14 @@
           } catch {
             // ignore
           }
-          setStatus("warn", "正在检测…", { autoHideMs: 0 });
+          if (!silent) setStatus("warn", "正在检测…", { autoHideMs: 0 });
           const r = await j(`/v1/pool/${encodeURIComponent(id)}/check`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ url, method }),
           });
+          upsertItem(r.item);
+          render();
           const s = r.success ? "good" : "bad";
           const msg =
             r.kind === "node"
@@ -557,10 +576,11 @@
               : r.success
                 ? `检测通过：HTTP ${r.httpStatus} · ${r.ms}ms`
                 : `检测失败：${r.error || `HTTP ${r.httpStatus}`}`;
-          setStatus(s, msg, { autoHideMs: r.success ? 4500 : 9000 });
-          await refresh();
+          if (!silent) setStatus(s, msg, { autoHideMs: r.success ? 4500 : 9000 });
+          return r;
         } catch (err) {
-          setStatus("bad", err.message || "检测失败", { autoHideMs: 9000 });
+          if (!silent) setStatus("bad", err.message || "检测失败", { autoHideMs: 9000 });
+          return null;
         }
       }
 
@@ -628,6 +648,58 @@
         }
       }
 
+      let bulkCheckRunning = false;
+      let bulkCheckCancel = false;
+
+      async function checkAll() {
+        const btn = $("btnCheckAll");
+        if (bulkCheckRunning) {
+          bulkCheckCancel = true;
+          btn.disabled = true;
+          setStatus("warn", "正在停止…（已发出的检测会继续完成）", { autoHideMs: 3500 });
+          return;
+        }
+
+        const items = getFilteredItems();
+        if (!items.length) {
+          setStatus("warn", "没有可检测项（请调整筛选）", { autoHideMs: 2500 });
+          return;
+        }
+
+        bulkCheckRunning = true;
+        bulkCheckCancel = false;
+        btn.textContent = "停止检测";
+        try {
+          let done = 0;
+          for (let i = 0; i < items.length; i++) {
+            if (bulkCheckCancel) break;
+            const it = items[i];
+            const kind = itemKind(it);
+            const label =
+              kind === "node"
+                ? parseNodeBrief(it?.node)?.remark || it?.label || it?.id
+                : it?.proxy?.server || it?.label || it?.id;
+            setStatus("warn", `检测 ${i + 1}/${items.length}：${label}`, { autoHideMs: 0 });
+            // sequential keeps load predictable (Playwright proxy checks are heavy)
+            // eslint-disable-next-line no-await-in-loop
+            await checkProxy(it.id, { silent: true });
+            done += 1;
+          }
+
+          if (bulkCheckCancel) {
+            setStatus("warn", `已停止：已完成 ${done}/${items.length} 项`, { autoHideMs: 4500 });
+          } else {
+            setStatus("good", `检测完成：共 ${items.length} 项`, { autoHideMs: 4500 });
+          }
+        } finally {
+          bulkCheckRunning = false;
+          bulkCheckCancel = false;
+          btn.disabled = false;
+          btn.textContent = "一键检测";
+          await refresh();
+        }
+      }
+
       $("btnRefresh").addEventListener("click", refresh);
       $("btnPick").addEventListener("click", pickRandom);
       $("btnAdd").addEventListener("click", addProxies);
@@ -644,6 +716,7 @@
         render();
       });
       $("btnPurgeDisabled").addEventListener("click", purgeDisabled);
+      $("btnCheckAll").addEventListener("click", checkAll);
 
       $("btnLogout").addEventListener("click", async () => {
         try {

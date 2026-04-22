@@ -557,6 +557,85 @@ function listNodeItems(store) {
   return nodes.filter((x) => x && typeof x === 'object' && typeof x.id === 'string' && x.fullLink);
 }
 
+function removePoolItemsByPredicate(store, shouldRemove) {
+  const pool = Array.isArray(store.pool) ? store.pool : [];
+  const kept = [];
+  const removed = [];
+
+  for (const it of pool) {
+    if (it && typeof it === 'object' && shouldRemove(it)) removed.push(it);
+    else kept.push(it);
+  }
+
+  if (!removed.length) return { removedIds: [], removedItems: [] };
+  store.pool = kept;
+  return {
+    removedIds: removed.map((x) => String(x?.id || '').trim()).filter(Boolean),
+    removedItems: removed,
+  };
+}
+
+function pruneProfilePoliciesReferencingPoolIds(store, removedIds) {
+  const ids = Array.isArray(removedIds) ? removedIds.map((s) => String(s || '').trim()).filter(Boolean) : [];
+  const uniq = Array.from(new Set(ids));
+  if (!uniq.length) return { affectedProfiles: [], removedRefs: 0, deletedPolicies: 0 };
+
+  const removed = new Set(uniq);
+  store.profiles = store.profiles && typeof store.profiles === 'object' ? store.profiles : {};
+  const profiles = store.profiles;
+
+  const affectedProfiles = [];
+  let removedRefs = 0;
+  let deletedPolicies = 0;
+  const updatedAt = nowIso();
+
+  for (const profile of Object.keys(profiles)) {
+    const entry = profiles[profile];
+    if (!entry || typeof entry !== 'object') continue;
+
+    const policyObj =
+      entry.poolPolicy && typeof entry.poolPolicy === 'object' && Array.isArray(entry.poolPolicy.items)
+        ? entry.poolPolicy
+        : null;
+    if (!policyObj) continue;
+
+    const oldItems = sanitizePoolPolicyItems(policyObj.items);
+    const nextItems = oldItems.filter((x) => !removed.has(x.poolItemId));
+    const stickyPoolItemId = typeof policyObj.stickyPoolItemId === 'string' ? policyObj.stickyPoolItemId.trim() : '';
+    const stickyRemoved = stickyPoolItemId && removed.has(stickyPoolItemId);
+
+    if (nextItems.length === oldItems.length && !stickyRemoved) continue;
+
+    removedRefs += oldItems.length - nextItems.length;
+    affectedProfiles.push(profile);
+
+    if (!nextItems.length) {
+      delete entry.poolPolicy;
+      deletedPolicies += 1;
+    } else {
+      entry.poolPolicy = {
+        ...(policyObj && typeof policyObj === 'object' ? policyObj : {}),
+        items: nextItems,
+        updatedAt,
+        stickyPoolItemId: null,
+        stickyAt: null,
+      };
+    }
+
+    // If profile entry no longer has anything meaningful, remove it entirely.
+    const hasStaticProxy = !!normalizeProxy(entry?.proxy ?? entry);
+    const remainingKeys = Object.keys(entry || {}).filter((k) => !['updatedAt'].includes(k));
+    if (!hasStaticProxy && remainingKeys.length === 0) {
+      delete profiles[profile];
+    } else {
+      profiles[profile] = entry;
+    }
+  }
+
+  store.profiles = profiles;
+  return { affectedProfiles, removedRefs, deletedPolicies };
+}
+
 function clampString(s, maxLen) {
   const v = String(s || '').trim();
   if (!v) return '';
@@ -1751,6 +1830,8 @@ app.put('/v1/nodes/:id', (req, res) => {
   if (idx < 0) return res.status(404).json({ ok: false, error: 'not found' });
 
   const it = items[idx];
+  const body = req.body && typeof req.body === 'object' ? req.body : null;
+  const enabledTouched = !!(body && Object.prototype.hasOwnProperty.call(body, 'enabled'));
   if (req.body && typeof req.body === 'object') {
     if ('enabled' in req.body) it.enabled = req.body.enabled === false ? false : true;
     if (typeof req.body.label === 'string') it.label = req.body.label.trim();
@@ -1758,8 +1839,29 @@ app.put('/v1/nodes/:id', (req, res) => {
   it.updatedAt = nowIso();
 
   store.nodes = items;
+  let cascade = null;
+  if (enabledTouched && it.enabled === false) {
+    const fullLink = typeof it.fullLink === 'string' ? it.fullLink.trim() : '';
+    const removedPool = removePoolItemsByPredicate(store, (p) => {
+      if (!p || typeof p !== 'object') return false;
+      if (poolItemKind(p) !== 'node') return false;
+      const byId = typeof p.nodeId === 'string' && p.nodeId.trim() ? p.nodeId.trim() : '';
+      if (byId && byId === id) return true;
+      const link = poolItemNodeLink(p.node);
+      return fullLink && link === fullLink;
+    });
+    const pruned = pruneProfilePoliciesReferencingPoolIds(store, removedPool.removedIds);
+    cascade = {
+      reason: 'node_disabled',
+      removedPoolItems: removedPool.removedIds.length,
+      removedPoolItemIds: removedPool.removedIds,
+      prunedProfiles: pruned.affectedProfiles,
+      removedPolicyRefs: pruned.removedRefs,
+      deletedPolicies: pruned.deletedPolicies,
+    };
+  }
   const written = writeStore(store);
-  return res.json({ ok: true, item: it, storeUpdatedAt: written.updatedAt });
+  return res.json({ ok: true, item: it, cascade, storeUpdatedAt: written.updatedAt });
 });
 
 app.delete('/v1/nodes/:id', (req, res) => {
@@ -1771,10 +1873,34 @@ app.delete('/v1/nodes/:id', (req, res) => {
   const idx = items.findIndex((x) => x && x.id === id);
   if (idx < 0) return res.status(404).json({ ok: false, error: 'not found' });
 
+  const removedNode = items[idx];
+  const fullLink = typeof removedNode?.fullLink === 'string' ? removedNode.fullLink.trim() : '';
   items.splice(idx, 1);
   store.nodes = items;
+
+  const removedPool = removePoolItemsByPredicate(store, (p) => {
+    if (!p || typeof p !== 'object') return false;
+    if (poolItemKind(p) !== 'node') return false;
+    const byId = typeof p.nodeId === 'string' && p.nodeId.trim() ? p.nodeId.trim() : '';
+    if (byId && byId === id) return true;
+    const link = poolItemNodeLink(p.node);
+    return fullLink && link === fullLink;
+  });
+  const pruned = pruneProfilePoliciesReferencingPoolIds(store, removedPool.removedIds);
+
   const written = writeStore(store);
-  return res.json({ ok: true, storeUpdatedAt: written.updatedAt });
+  return res.json({
+    ok: true,
+    cascade: {
+      reason: 'node_deleted',
+      removedPoolItems: removedPool.removedIds.length,
+      removedPoolItemIds: removedPool.removedIds,
+      prunedProfiles: pruned.affectedProfiles,
+      removedPolicyRefs: pruned.removedRefs,
+      deletedPolicies: pruned.deletedPolicies,
+    },
+    storeUpdatedAt: written.updatedAt,
+  });
 });
 
 app.post('/v1/nodes/:id/check', async (req, res) => {
@@ -2129,11 +2255,23 @@ app.delete('/v1/pool/:id', (req, res) => {
   if (!id) return res.status(400).json({ ok: false, error: 'id required' });
 
   const store = readStore();
-  const pool = listPoolItems(store);
-  const next = pool.filter((x) => x.id !== id);
-  store.pool = next;
+  const poolRaw = Array.isArray(store.pool) ? store.pool : [];
+  const removed = poolRaw.filter((x) => x && typeof x === 'object' && String(x.id || '') === id);
+  store.pool = poolRaw.filter((x) => !(x && typeof x === 'object' && String(x.id || '') === id));
+
+  const pruned = pruneProfilePoliciesReferencingPoolIds(store, removed.length ? [id] : []);
   const written = writeStore(store);
-  res.json({ ok: true, deleted: pool.length - next.length, storeUpdatedAt: written.updatedAt });
+  res.json({
+    ok: true,
+    deleted: removed.length,
+    cascade: {
+      reason: 'pool_item_deleted',
+      prunedProfiles: pruned.affectedProfiles,
+      removedPolicyRefs: pruned.removedRefs,
+      deletedPolicies: pruned.deletedPolicies,
+    },
+    storeUpdatedAt: written.updatedAt,
+  });
 });
 
 app.post('/v1/pool/:id/check', async (req, res) => {
@@ -3285,7 +3423,15 @@ function getBootstrapInfo() {
   };
 }
 
-module.exports = { app, startServer, getBootstrapInfo };
+module.exports = {
+  app,
+  startServer,
+  getBootstrapInfo,
+  _internals: {
+    removePoolItemsByPredicate,
+    pruneProfilePoliciesReferencingPoolIds,
+  },
+};
 
 if (require.main === module) {
   startServer().catch((err) => {
