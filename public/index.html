@@ -292,6 +292,34 @@
 
       let pager = null;
       let checkInited = false;
+      let queryInited = false;
+      let focusId = "";
+
+      function getQueryParams() {
+        try {
+          return new URLSearchParams(location.search || "");
+        } catch {
+          return new URLSearchParams();
+        }
+      }
+
+      function applyQueryParamsOnce() {
+        if (queryInited) return;
+        queryInited = true;
+        const p = getQueryParams();
+        const q = String(p.get("q") || "").trim();
+        const only = String(p.get("onlyEnabled") || p.get("enabled") || "").trim();
+        const focus = String(p.get("focus") || "").trim();
+
+        if (q) $("search").value = q;
+        if (only) {
+          const on = ["1", "true", "yes", "y", "on"].includes(only.toLowerCase());
+          state.onlyEnabled = on;
+          $("btnOnlyEnabled").setAttribute("aria-pressed", String(state.onlyEnabled));
+          $("btnOnlyEnabled").textContent = state.onlyEnabled ? "只看启用 ✓" : "只看启用";
+        }
+        focusId = focus || q || "";
+      }
 
       function clampTableScroll() {
         const box = document.querySelector(".tablebox");
@@ -305,6 +333,28 @@
             // ignore
           }
         });
+      }
+
+      function highlightFocusRow() {
+        const id = String(focusId || "").trim();
+        if (!id) return;
+        const tbody = $("tbody");
+        if (!tbody) return;
+        const escId = (() => {
+          try {
+            return CSS && typeof CSS.escape === "function" ? CSS.escape(id) : id.replaceAll('"', '\\"');
+          } catch {
+            return id.replaceAll('"', '\\"');
+          }
+        })();
+        const row = tbody.querySelector(`tr[data-item-id="${escId}"]`);
+        if (!row) return;
+        row.classList.add("row-focus");
+        try {
+          row.scrollIntoView({ block: "center", inline: "nearest" });
+        } catch {
+          // ignore
+        }
       }
 
       function getFilteredItems() {
@@ -348,6 +398,7 @@
               : "—";
 
           const tr = document.createElement("tr");
+          tr.dataset.itemId = String(it.id || "");
           if (kind === "node") {
             const n = parseNodeBrief(it?.node);
             const country = n.country || "其他";
@@ -457,6 +508,7 @@
           tbody.appendChild(tr);
         }
         clampTableScroll();
+        highlightFocusRow();
       }
 
       function upsertItem(updated) {
@@ -817,6 +869,7 @@
       });
 
       window.addEventListener("DOMContentLoaded", () => {
+        applyQueryParamsOnce();
         pager = window.createPager({
           sizeSel: $("pageSize"),
           prevBtn: $("pagePrev"),
@@ -830,6 +883,7 @@
 
       // Use pageshow to handle bfcache (back/forward) after logout / cookie changes.
       window.addEventListener("pageshow", () => {
+        applyQueryParamsOnce();
         pager?.reset();
         refresh();
       });

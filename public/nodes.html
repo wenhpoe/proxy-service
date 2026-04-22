@@ -192,12 +192,14 @@
       function matchItem(it, q) {
         if (!q) return true;
         const s = String(q).trim().toLowerCase();
+        const id = String(it?.id || "").toLowerCase();
         const a = String(it?.remark || "").toLowerCase();
         const b = String(it?.host || "").toLowerCase();
         const c = String(it?.label || "").toLowerCase();
         const d = String(it?.country || "").toLowerCase();
         const e = String(it?.protocol || "").toLowerCase();
         return (
+          id.includes(s) ||
           a.includes(s) ||
           b.includes(s) ||
           c.includes(s) ||
@@ -215,6 +217,56 @@
 
       let pager = null;
       let checkInited = false;
+      let queryInited = false;
+      let focusId = "";
+
+      function getQueryParams() {
+        try {
+          return new URLSearchParams(location.search || "");
+        } catch {
+          return new URLSearchParams();
+        }
+      }
+
+      function applyQueryParamsOnce() {
+        if (queryInited) return;
+        queryInited = true;
+        const p = getQueryParams();
+        const q = String(p.get("q") || "").trim();
+        const only = String(p.get("onlyEnabled") || p.get("enabled") || "").trim();
+        const focus = String(p.get("focus") || "").trim();
+
+        if (q) $("search").value = q;
+        if (only) {
+          const on = ["1", "true", "yes", "y", "on"].includes(only.toLowerCase());
+          state.onlyEnabled = on;
+          $("btnOnlyEnabled").setAttribute("aria-pressed", String(state.onlyEnabled));
+          $("btnOnlyEnabled").textContent = state.onlyEnabled ? "只看启用 ✓" : "只看启用";
+        }
+        focusId = focus || q || "";
+      }
+
+      function highlightFocusRow() {
+        const id = String(focusId || "").trim();
+        if (!id) return;
+        const tbody = $("tbody");
+        if (!tbody) return;
+        const escId = (() => {
+          try {
+            return CSS && typeof CSS.escape === "function" ? CSS.escape(id) : id.replaceAll('"', '\\"');
+          } catch {
+            return id.replaceAll('"', '\\"');
+          }
+        })();
+        const row = tbody.querySelector(`tr[data-node-id="${escId}"]`);
+        if (!row) return;
+        row.classList.add("row-focus");
+        try {
+          row.scrollIntoView({ block: "center", inline: "nearest" });
+        } catch {
+          // ignore
+        }
+      }
 
       function getFilteredItems() {
         const q = $("search").value || "";
@@ -272,6 +324,7 @@
             else badgeClass = "warn";
           }
           const tr = document.createElement("tr");
+          tr.dataset.nodeId = String(it.id || "");
           tr.innerHTML = `
             <td>
               <div class="switch">
@@ -343,6 +396,7 @@
           `;
           tbody.appendChild(tr);
         }
+        highlightFocusRow();
       }
 
       function fillCountryOptions(countries, selected) {
@@ -681,6 +735,7 @@
       });
 
       window.addEventListener("DOMContentLoaded", () => {
+        applyQueryParamsOnce();
         pager = window.createPager({
           sizeSel: $("pageSize"),
           prevBtn: $("pagePrev"),
@@ -693,6 +748,7 @@
       });
 
       window.addEventListener("pageshow", () => {
+        applyQueryParamsOnce();
         pager?.reset();
         refresh();
       });
