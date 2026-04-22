@@ -531,6 +531,27 @@ function getProfilePoolPolicy(entry) {
   return { items, stickyPoolItemId: stickyPoolItemId || null, stickyAt, updatedAt };
 }
 
+function policyAvailability(policy, poolById) {
+  const items = policy && Array.isArray(policy.items) ? policy.items : [];
+  let missing = 0;
+  let disabled = 0;
+  let unusable = 0;
+
+  for (const x of items) {
+    const poolItemId = x && typeof x === 'object' ? String(x.poolItemId || '').trim() : '';
+    if (!poolItemId) continue;
+    const it = poolById.get(poolItemId) || null;
+    if (!it) {
+      missing += 1;
+      continue;
+    }
+    if (it.enabled === false) disabled += 1;
+    if (poolItemKind(it) === 'node' && !poolItemNodeLink(it.node)) unusable += 1;
+  }
+
+  return { missing, disabled, unusable };
+}
+
 function listNodeItems(store) {
   const nodes = Array.isArray(store.nodes) ? store.nodes : [];
   return nodes.filter((x) => x && typeof x === 'object' && typeof x.id === 'string' && x.fullLink);
@@ -2486,8 +2507,65 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
       }
     }
 
-    // Policy exists but no enabled items (or nothing could be picked): do NOT fall back to global pool,
-    // to avoid unexpected IP rotations for this account.
+    // Policy exists but no enabled items (or nothing could be picked):
+    // fall back to global pool to avoid going direct (still mark policyNoAvailable=true).
+    const availability = policyAvailability(policy, byId);
+    const fallback = pickRandomEnabled(pool);
+    if (fallback) {
+      fallback.lastUsedAt = nowIso();
+      store.pool = pool;
+      writeStore(store);
+      const kind = poolItemKind(fallback);
+      if (kind === 'node') {
+        const link = poolItemNodeLink(fallback?.node);
+        if (!link) {
+          return res.json({
+            ok: true,
+            profile,
+            source: 'profile_pool_fallback',
+            proxy: null,
+            node: null,
+            policyNoAvailable: true,
+            policyItems: policy.items.length,
+            policyEnabled: allowedItems.length,
+            policyMissing: availability.missing,
+            policyDisabled: availability.disabled,
+            policyUnusable: availability.unusable,
+            updatedAt: store.updatedAt || null,
+          });
+        }
+        return res.json({
+          ok: true,
+          profile,
+          source: 'profile_pool_fallback',
+          proxy: null,
+          node: fallback.node,
+          poolItemId: fallback.id,
+          policyNoAvailable: true,
+          policyItems: policy.items.length,
+          policyEnabled: allowedItems.length,
+          policyMissing: availability.missing,
+          policyDisabled: availability.disabled,
+          policyUnusable: availability.unusable,
+          updatedAt: store.updatedAt || null,
+        });
+      }
+      return res.json({
+        ok: true,
+        profile,
+        source: 'profile_pool_fallback',
+        proxy: fallback.proxy,
+        poolItemId: fallback.id,
+        policyNoAvailable: true,
+        policyItems: policy.items.length,
+        policyEnabled: allowedItems.length,
+        policyMissing: availability.missing,
+        policyDisabled: availability.disabled,
+        policyUnusable: availability.unusable,
+        updatedAt: store.updatedAt || null,
+      });
+    }
+
     return res.json({
       ok: true,
       profile,
@@ -2497,6 +2575,9 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
       policyNoAvailable: true,
       policyItems: policy.items.length,
       policyEnabled: allowedItems.length,
+      policyMissing: availability.missing,
+      policyDisabled: availability.disabled,
+      policyUnusable: availability.unusable,
       updatedAt: store.updatedAt || null,
     });
   }
@@ -2885,6 +2966,63 @@ app.get('/v1/proxy/:profile', async (req, res) => {
       }
     }
 
+    const availability = policyAvailability(policy, byId);
+    const fallback = pickRandomEnabled(pool);
+    if (fallback) {
+      fallback.lastUsedAt = nowIso();
+      store.pool = pool;
+      writeStore(store);
+      const kind = poolItemKind(fallback);
+      if (kind === 'node') {
+        const link = poolItemNodeLink(fallback?.node);
+        if (!link) {
+          return res.json({
+            ok: true,
+            profile,
+            source: 'profile_pool_fallback',
+            proxy: null,
+            node: null,
+            policyNoAvailable: true,
+            policyItems: policy.items.length,
+            policyEnabled: allowedItems.length,
+            policyMissing: availability.missing,
+            policyDisabled: availability.disabled,
+            policyUnusable: availability.unusable,
+            updatedAt: store.updatedAt || null,
+          });
+        }
+        return res.json({
+          ok: true,
+          profile,
+          source: 'profile_pool_fallback',
+          proxy: null,
+          node: fallback.node,
+          poolItemId: fallback.id,
+          policyNoAvailable: true,
+          policyItems: policy.items.length,
+          policyEnabled: allowedItems.length,
+          policyMissing: availability.missing,
+          policyDisabled: availability.disabled,
+          policyUnusable: availability.unusable,
+          updatedAt: store.updatedAt || null,
+        });
+      }
+      return res.json({
+        ok: true,
+        profile,
+        source: 'profile_pool_fallback',
+        proxy: fallback.proxy,
+        poolItemId: fallback.id,
+        policyNoAvailable: true,
+        policyItems: policy.items.length,
+        policyEnabled: allowedItems.length,
+        policyMissing: availability.missing,
+        policyDisabled: availability.disabled,
+        policyUnusable: availability.unusable,
+        updatedAt: store.updatedAt || null,
+      });
+    }
+
     return res.json({
       ok: true,
       profile,
@@ -2894,6 +3032,9 @@ app.get('/v1/proxy/:profile', async (req, res) => {
       policyNoAvailable: true,
       policyItems: policy.items.length,
       policyEnabled: allowedItems.length,
+      policyMissing: availability.missing,
+      policyDisabled: availability.disabled,
+      policyUnusable: availability.unusable,
       updatedAt: store.updatedAt || null,
     });
   }
