@@ -114,7 +114,7 @@
                   <input
                     class="input mono"
                     id="checkUrl"
-                    placeholder="检测 URL（例如 https://www.google.com/generate_204）"
+                    placeholder="检测 URL（例如 https://labs.google/fx/tools/flow/）"
                     style="width: 360px"
                     autocomplete="off"
                   />
@@ -466,21 +466,26 @@
           state.storePath = store.storePath || "—";
           $("storePath").textContent = state.storePath;
 
-          if (!checkInited) {
-            checkInited = true;
-            const poolCheck = store && store.poolCheck ? store.poolCheck : null;
-            const defaultUrl = poolCheck && poolCheck.url ? String(poolCheck.url) : "";
-            const defaultMethod = poolCheck && poolCheck.method ? String(poolCheck.method) : "HEAD";
-            try {
-              const savedUrl = localStorage.getItem("pool_check_url") || "";
-              const savedMethod = localStorage.getItem("pool_check_method") || "";
+            if (!checkInited) {
+              checkInited = true;
+              const poolCheck = store && store.poolCheck ? store.poolCheck : null;
+              const defaultUrl = poolCheck && poolCheck.url ? String(poolCheck.url) : "";
+              const defaultMethod = poolCheck && poolCheck.method ? String(poolCheck.method) : "HEAD";
+              try {
+              const savedUrlRaw = localStorage.getItem("pool_check_url") || "";
+              const savedMethodRaw = localStorage.getItem("pool_check_method") || "";
+              // If user still has the old default (google generate_204) saved, auto-upgrade to the new default.
+              const savedUrl =
+                String(savedUrlRaw || "").includes("google.com/generate_204") ? "" : String(savedUrlRaw || "");
+              const savedMethod =
+                String(savedUrlRaw || "").includes("google.com/generate_204") ? "" : String(savedMethodRaw || "");
               $("checkUrl").value = savedUrl || $("checkUrl").value || defaultUrl;
               $("checkMethod").value = savedMethod || $("checkMethod").value || defaultMethod;
-            } catch {
-              $("checkUrl").value = $("checkUrl").value || defaultUrl;
-              $("checkMethod").value = $("checkMethod").value || defaultMethod;
+              } catch {
+                $("checkUrl").value = $("checkUrl").value || defaultUrl;
+                $("checkMethod").value = $("checkMethod").value || defaultMethod;
+              }
             }
-          }
 
           const items = Array.isArray(pool.items) ? pool.items : [];
           state.items = items;

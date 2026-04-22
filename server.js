@@ -908,9 +908,10 @@ function sanitizeHttpUrl(urlRaw) {
 }
 
 function getPoolCheckDefaults() {
-  const urlRaw = String(process.env.PROXY_POOL_CHECK_URL || '').trim() || 'https://www.google.com/generate_204';
-  const methodRaw = String(process.env.PROXY_POOL_CHECK_METHOD || '').trim().toUpperCase() || 'HEAD';
-  const method = ['GET', 'HEAD'].includes(methodRaw) ? methodRaw : 'HEAD';
+  const urlRaw =
+    String(process.env.PROXY_POOL_CHECK_URL || '').trim() || 'https://labs.google/fx/tools/flow/';
+  const methodRaw = String(process.env.PROXY_POOL_CHECK_METHOD || '').trim().toUpperCase() || 'GET';
+  const method = ['GET', 'HEAD'].includes(methodRaw) ? methodRaw : 'GET';
   const timeoutRaw = process.env.PROXY_POOL_CHECK_TIMEOUT_MS;
   const timeoutMsParsed = timeoutRaw != null ? Number(timeoutRaw) : NaN;
   const timeoutMs = Number.isFinite(timeoutMsParsed) ? timeoutMsParsed : 6500;
