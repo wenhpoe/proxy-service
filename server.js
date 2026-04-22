@@ -279,10 +279,8 @@ function isApiRequest(req) {
 function ensureStore() {
   fs.mkdirSync(path.dirname(STORE_PATH), { recursive: true });
   if (!fs.existsSync(STORE_PATH)) {
-    fs.writeFileSync(
-      STORE_PATH,
-      JSON.stringify({ version: 1, updatedAt: nowIso(), profiles: {}, pool: [] }, null, 2),
-    );
+    const init = JSON.stringify({ version: 1, updatedAt: nowIso(), profiles: {}, pool: [] }, null, 2);
+    fs.writeFileSync(STORE_PATH, init);
   }
 }
 
@@ -301,6 +299,45 @@ function readStore() {
   }
 }
 
+function writeFileAtomicSync(filePath, contents) {
+  const fp = String(filePath || '').trim();
+  if (!fp) throw new Error('filePath required');
+  const dir = path.dirname(fp);
+  fs.mkdirSync(dir, { recursive: true });
+  const base = path.basename(fp);
+  const tmp = path.join(dir, `.${base}.tmp-${process.pid}-${Date.now()}`);
+  fs.writeFileSync(tmp, contents, 'utf8');
+  try {
+    fs.renameSync(tmp, fp);
+  } catch (e) {
+    // Windows may not allow renaming over an existing file.
+    try {
+      fs.rmSync(fp, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      fs.renameSync(tmp, fp);
+    } catch (e2) {
+      try {
+        fs.copyFileSync(tmp, fp);
+      } finally {
+        try {
+          fs.rmSync(tmp, { force: true });
+        } catch {
+          // ignore
+        }
+      }
+      // Re-throw the original error only if copy also fails (copy succeeded -> treat as ok).
+      try {
+        fs.accessSync(fp, fs.constants.F_OK);
+      } catch {
+        throw e2 || e;
+      }
+    }
+  }
+}
+
 function writeStore(next) {
   ensureStore();
   const payload = {
@@ -312,7 +349,7 @@ function writeStore(next) {
     activationCodes: Array.isArray(next.activationCodes) ? next.activationCodes : [],
     machines: next.machines && typeof next.machines === 'object' ? next.machines : {},
   };
-  fs.writeFileSync(STORE_PATH, JSON.stringify(payload, null, 2));
+  writeFileAtomicSync(STORE_PATH, JSON.stringify(payload, null, 2));
   return payload;
 }
 
@@ -1379,7 +1416,7 @@ function readAccountStorageState(profile) {
 
 function writeAccountStorageState(profile, storageState) {
   const fp = accountFilePath(profile);
-  fs.writeFileSync(fp, JSON.stringify(storageState, null, 2));
+  writeFileAtomicSync(fp, JSON.stringify(storageState, null, 2));
   return fp;
 }
 
