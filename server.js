@@ -316,6 +316,40 @@ function writeStore(next) {
   return payload;
 }
 
+let STORE_PATCH_QUEUE = Promise.resolve();
+
+function patchStoreQueued(patchFn) {
+  const run = () => {
+    const store = readStore();
+    let patch;
+    try {
+      patch = typeof patchFn === 'function' ? patchFn(store) : null;
+    } catch (e) {
+      const msg = e && e.message ? String(e.message) : String(e);
+      return { ok: false, error: msg.slice(0, 280), storeUpdatedAt: store.updatedAt || null };
+    }
+
+    const changed =
+      patch === true ? true : patch && typeof patch === 'object' && patch.changed === true ? true : false;
+
+    if (!changed) {
+      if (patch && typeof patch === 'object') {
+        return { ok: true, ...patch, changed: false, storeUpdatedAt: store.updatedAt || null };
+      }
+      return { ok: true, changed: false, storeUpdatedAt: store.updatedAt || null };
+    }
+
+    const written = writeStore(store);
+    if (patch && typeof patch === 'object') {
+      return { ok: true, ...patch, changed: true, storeUpdatedAt: written.updatedAt };
+    }
+    return { ok: true, changed: true, storeUpdatedAt: written.updatedAt };
+  };
+
+  STORE_PATCH_QUEUE = STORE_PATCH_QUEUE.then(run, run);
+  return STORE_PATCH_QUEUE;
+}
+
 function sanitizeName(name) {
   const cleaned = String(name || '').trim();
   if (!cleaned) throw new Error('profile required');
@@ -1102,19 +1136,22 @@ async function runPoolNodeAutoToggleOnce({ reason = 'interval' } = {}) {
 
   try {
     const cfg = getPoolNodeAutoToggleDefaults();
-    const store = readStore();
-    const pool = Array.isArray(store.pool) ? store.pool : [];
-    let changed = false;
+    const store0 = readStore();
+    const pool0 = Array.isArray(store0.pool) ? store0.pool : [];
 
-    for (let i = 0; i < pool.length; i++) {
-      const it = pool[i];
+    const updates = [];
+
+    for (const it of pool0) {
       if (!it || typeof it !== 'object') continue;
       if (poolItemKind(it) !== 'node') continue;
       if (!poolItemNodeLink(it.node)) continue;
-
       const target = parseNodeTargetFromPoolItem(it);
       if (!target) continue;
+      updates.push({ id: String(it.id || ''), target });
+    }
 
+    for (const u of updates) {
+      if (!u.id) continue;
       checkedNodes += 1;
       let okCount = 0;
       let failCount = 0;
@@ -1123,9 +1160,9 @@ async function runPoolNodeAutoToggleOnce({ reason = 'interval' } = {}) {
       for (let t = 0; t < cfg.tries; t++) {
         // eslint-disable-next-line no-await-in-loop
         last = await performNodeReachabilityCheck({
-          host: target.host,
-          port: target.port,
-          checkType: target.checkType,
+          host: u.target.host,
+          port: u.target.port,
+          checkType: u.target.checkType,
           timeoutMs: cfg.timeoutMs,
         });
         if (last && last.success) okCount += 1;
@@ -1142,62 +1179,93 @@ async function runPoolNodeAutoToggleOnce({ reason = 'interval' } = {}) {
       else if (stable === 'fail') stableFail += 1;
       else mixed += 1;
 
-      it.autoCheckAt = checkedAt;
-      it.autoCheckKind = 'node';
-      it.autoCheckType = target.checkType;
-      it.autoCheckTimeoutMs = cfg.timeoutMs;
-      it.autoCheckTries = cfg.tries;
-      it.autoCheckOkCount = okCount;
-      it.autoCheckFailCount = failCount;
-      it.autoCheckStable = stable;
-      it.autoCheckDetail =
-        stable === 'mixed'
-          ? `MIXED ok=${okCount}/${cfg.tries}`
-          : last?.detail
-            ? String(last.detail)
-            : stable === 'ok'
-              ? 'OK'
-              : 'FAIL';
-      it.autoCheckError = last?.error ? String(last.error) : '';
-      it.autoCheckMs = last && typeof last.ms === 'number' ? last.ms : null;
-      it.autoCheckIp = last?.ip || null;
-      it.autoCheckReason = String(reason || '').slice(0, 40);
+      u.okCount = okCount;
+      u.failCount = failCount;
+      u.stable = stable;
+      u.last = last;
+    }
 
-      // Also update the common pool "lastCheck*" fields so the UI shows the latest auto-check summary.
-      it.lastCheckAt = checkedAt;
-      it.lastCheckKind = 'node';
-      it.lastCheckType = target.checkType;
-      it.lastCheckTimeoutMs = cfg.timeoutMs;
-      it.lastCheckMs = it.autoCheckMs;
-      it.lastCheckOk = stable === 'ok' ? true : stable === 'fail' ? false : null;
-      it.lastCheckIp = it.autoCheckIp;
-      it.lastCheckDetail = it.autoCheckDetail;
-      it.lastCheckError = it.autoCheckError;
-      it.lastCheckUrl = null;
-      it.lastCheckMethod = null;
-      it.lastCheckHttpStatus = null;
+    const patched = await patchStoreQueued((s) => {
+      const list = Array.isArray(s.pool) ? s.pool : [];
+      let changed = false;
+      let on = 0;
+      let off = 0;
 
-      if (stable === 'ok' && it.enabled === false) {
-        it.enabled = true;
-        it.autoToggledAt = checkedAt;
-        it.autoToggledTo = true;
-        it.autoToggledReason = `stable ok ${okCount}/${cfg.tries}`;
-        enabledOn += 1;
-        changed = true;
-      } else if (stable === 'fail' && it.enabled !== false) {
-        it.enabled = false;
-        it.autoToggledAt = checkedAt;
-        it.autoToggledTo = false;
-        it.autoToggledReason = `stable fail ${failCount}/${cfg.tries}`;
-        enabledOff += 1;
+      const byId = new Map(list.map((x, i) => [x && typeof x === 'object' ? String(x.id || '') : '', i]));
+
+      for (const u of updates) {
+        const idx = byId.get(u.id);
+        if (idx == null) continue;
+        const it = list[idx];
+        if (!it || typeof it !== 'object') continue;
+        if (poolItemKind(it) !== 'node') continue;
+        if (!poolItemNodeLink(it.node)) continue;
+
+        const okCount = Number.isFinite(Number(u.okCount)) ? Number(u.okCount) : 0;
+        const failCount = Number.isFinite(Number(u.failCount)) ? Number(u.failCount) : 0;
+        const stable = u.stable === 'ok' || u.stable === 'fail' || u.stable === 'mixed' ? u.stable : 'mixed';
+        const last = u.last && typeof u.last === 'object' ? u.last : null;
+
+        it.autoCheckAt = checkedAt;
+        it.autoCheckKind = 'node';
+        it.autoCheckType = u.target.checkType;
+        it.autoCheckTimeoutMs = cfg.timeoutMs;
+        it.autoCheckTries = cfg.tries;
+        it.autoCheckOkCount = okCount;
+        it.autoCheckFailCount = failCount;
+        it.autoCheckStable = stable;
+        it.autoCheckDetail =
+          stable === 'mixed'
+            ? `MIXED ok=${okCount}/${cfg.tries}`
+            : last?.detail
+              ? String(last.detail)
+              : stable === 'ok'
+                ? 'OK'
+                : 'FAIL';
+        it.autoCheckError = last?.error ? String(last.error) : '';
+        it.autoCheckMs = last && typeof last.ms === 'number' ? last.ms : null;
+        it.autoCheckIp = last?.ip || null;
+        it.autoCheckReason = String(reason || '').slice(0, 40);
+
+        // Also update the common pool "lastCheck*" fields so the UI shows the latest auto-check summary.
+        it.lastCheckAt = checkedAt;
+        it.lastCheckKind = 'node';
+        it.lastCheckType = u.target.checkType;
+        it.lastCheckTimeoutMs = cfg.timeoutMs;
+        it.lastCheckMs = it.autoCheckMs;
+        it.lastCheckOk = stable === 'ok' ? true : stable === 'fail' ? false : null;
+        it.lastCheckIp = it.autoCheckIp;
+        it.lastCheckDetail = it.autoCheckDetail;
+        it.lastCheckError = it.autoCheckError;
+        it.lastCheckUrl = null;
+        it.lastCheckMethod = null;
+        it.lastCheckHttpStatus = null;
+
+        if (stable === 'ok' && it.enabled === false) {
+          it.enabled = true;
+          it.autoToggledAt = checkedAt;
+          it.autoToggledTo = true;
+          it.autoToggledReason = `stable ok ${okCount}/${cfg.tries}`;
+          on += 1;
+        } else if (stable === 'fail' && it.enabled !== false) {
+          it.enabled = false;
+          it.autoToggledAt = checkedAt;
+          it.autoToggledTo = false;
+          it.autoToggledReason = `stable fail ${failCount}/${cfg.tries}`;
+          off += 1;
+        }
+
+        list[idx] = it;
         changed = true;
       }
-    }
 
-    if (changed) {
-      store.pool = pool;
-      writeStore(store);
-    }
+      if (!changed) return { changed: false, enabledOn: 0, enabledOff: 0 };
+      s.pool = list;
+      return { changed: true, enabledOn: on, enabledOff: off };
+    });
+
+    enabledOn = patched && patched.ok && typeof patched.enabledOn === 'number' ? patched.enabledOn : 0;
+    enabledOff = patched && patched.ok && typeof patched.enabledOff === 'number' ? patched.enabledOff : 0;
 
     const ms = Date.now() - startedAt;
     POOL_NODE_AUTOTOGGLE_LAST = {
@@ -1953,18 +2021,23 @@ app.post('/v1/nodes/:id/check', async (req, res) => {
   }
 
   const ms = Date.now() - startedAt;
-  it.lastCheckAt = checkedAt;
-  it.lastCheckType = checkType;
-  it.lastCheckTimeoutMs = timeoutMs;
-  it.lastCheckMs = ms;
-  it.lastCheckOk = !!success;
-  it.lastCheckIp = ip;
-  it.lastCheckDetail = detail;
-  it.lastCheckError = error || '';
-
-  items[idx] = it;
-  store.nodes = items;
-  const written = writeStore(store);
+  const patched = await patchStoreQueued((s) => {
+    const list = Array.isArray(s.nodes) ? s.nodes : [];
+    const i = list.findIndex((x) => x && typeof x === 'object' && x.id === id);
+    if (i < 0) return { changed: false, missing: true };
+    const cur = list[i];
+    cur.lastCheckAt = checkedAt;
+    cur.lastCheckType = checkType;
+    cur.lastCheckTimeoutMs = timeoutMs;
+    cur.lastCheckMs = ms;
+    cur.lastCheckOk = !!success;
+    cur.lastCheckIp = ip;
+    cur.lastCheckDetail = detail;
+    cur.lastCheckError = error || '';
+    list[i] = cur;
+    s.nodes = list;
+    return { changed: true, item: cur };
+  });
 
   return res.json({
     ok: true,
@@ -1979,8 +2052,9 @@ app.post('/v1/nodes/:id/check', async (req, res) => {
     success,
     detail,
     error: error || null,
-    storeUpdatedAt: written.updatedAt,
-    item: it,
+    storeUpdatedAt: patched?.storeUpdatedAt || store.updatedAt || null,
+    item: patched && patched.ok && patched.item ? patched.item : null,
+    storePatchError: patched && patched.ok === false ? patched.error || 'store patch failed' : null,
   });
 });
 
@@ -2350,24 +2424,32 @@ app.post('/v1/pool/:id/check', async (req, res) => {
     }
 
     const ms = Date.now() - startedAt;
-    cur.lastCheckAt = checkedAt;
-    cur.lastCheckKind = 'node';
-    cur.lastCheckType = checkType;
-    cur.lastCheckTimeoutMs = timeoutMs;
-    cur.lastCheckMs = ms;
-    cur.lastCheckOk = !!success;
-    cur.lastCheckIp = ip;
-    cur.lastCheckDetail = detail;
-    cur.lastCheckError = error || '';
+    const patched = await patchStoreQueued((s) => {
+      const list = Array.isArray(s.pool) ? s.pool : [];
+      const i = list.findIndex((x) => x && typeof x === 'object' && x.id === id);
+      if (i < 0) return { changed: false, missing: true };
+      const it = list[i];
+      if (poolItemKind(it) !== 'node') return { changed: false, kindChanged: true };
 
-    // Clear proxy-check fields (avoid confusion in UI)
-    cur.lastCheckUrl = null;
-    cur.lastCheckMethod = null;
-    cur.lastCheckHttpStatus = null;
+      it.lastCheckAt = checkedAt;
+      it.lastCheckKind = 'node';
+      it.lastCheckType = checkType;
+      it.lastCheckTimeoutMs = timeoutMs;
+      it.lastCheckMs = ms;
+      it.lastCheckOk = !!success;
+      it.lastCheckIp = ip;
+      it.lastCheckDetail = detail;
+      it.lastCheckError = error || '';
 
-    pool[idx] = cur;
-    store.pool = pool;
-    const written = writeStore(store);
+      // Clear proxy-check fields (avoid confusion in UI)
+      it.lastCheckUrl = null;
+      it.lastCheckMethod = null;
+      it.lastCheckHttpStatus = null;
+
+      list[i] = it;
+      s.pool = list;
+      return { changed: true, item: it };
+    });
     return res.json({
       ok: true,
       id,
@@ -2382,8 +2464,9 @@ app.post('/v1/pool/:id/check', async (req, res) => {
       success,
       detail,
       error: error || null,
-      storeUpdatedAt: written.updatedAt,
-      item: cur,
+      storeUpdatedAt: patched?.storeUpdatedAt || store.updatedAt || null,
+      item: patched && patched.ok && patched.item ? patched.item : null,
+      storePatchError: patched && patched.ok === false ? patched.error || 'store patch failed' : null,
     });
   }
 
@@ -2457,9 +2540,26 @@ app.post('/v1/pool/:id/check', async (req, res) => {
   cur.lastCheckOk = !!success;
   cur.lastCheckError = error || (success ? '' : `HTTP ${httpStatus}`);
 
-  pool[idx] = cur;
-  store.pool = pool;
-  const written = writeStore(store);
+  const patched = await patchStoreQueued((s) => {
+    const list = Array.isArray(s.pool) ? s.pool : [];
+    const i = list.findIndex((x) => x && typeof x === 'object' && x.id === id);
+    if (i < 0) return { changed: false, missing: true };
+    const it = list[i];
+    if (poolItemKind(it) !== 'proxy') return { changed: false, kindChanged: true };
+
+    it.lastCheckAt = checkedAt;
+    it.lastCheckKind = 'proxy';
+    it.lastCheckMs = ms;
+    it.lastCheckUrl = url;
+    it.lastCheckMethod = method;
+    it.lastCheckHttpStatus = httpStatus;
+    it.lastCheckOk = !!success;
+    it.lastCheckError = error || (success ? '' : `HTTP ${httpStatus}`);
+
+    list[i] = it;
+    s.pool = list;
+    return { changed: true, item: it };
+  });
 
   return res.json({
     ok: true,
@@ -2471,8 +2571,9 @@ app.post('/v1/pool/:id/check', async (req, res) => {
     httpStatus,
     success,
     error: error || (success ? null : `HTTP ${httpStatus}`),
-    storeUpdatedAt: written.updatedAt,
-    item: cur,
+    storeUpdatedAt: patched?.storeUpdatedAt || store.updatedAt || null,
+    item: patched && patched.ok && patched.item ? patched.item : null,
+    storePatchError: patched && patched.ok === false ? patched.error || 'store patch failed' : null,
   });
 });
 
