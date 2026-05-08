@@ -1,5 +1,16 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+
+const DEFAULT_ADMIN_PASSWORD = "123456";
+
+function renderDefaultEnv() {
+    return [
+        `PROXY_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD}`,
+        `PROXY_ADMIN_SESSION_SECRET=${crypto.randomBytes(32).toString("hex")}`,
+        "",
+    ].join("\n");
+}
 
 function main() {
     const root = path.join(__dirname, "..");
@@ -14,12 +25,8 @@ function main() {
     }
 
     if (!fs.existsSync(src)) {
-        try {
-            if (fs.existsSync(dst)) fs.unlinkSync(dst);
-        } catch {
-            // ignore
-        }
-        process.stdout.write("ℹ️ No proxy-service/.env found; skip bundling env.\n");
+        fs.writeFileSync(dst, renderDefaultEnv(), "utf8");
+        process.stdout.write(`ℹ️ No proxy-service/.env found; wrote default bundled env (${DEFAULT_ADMIN_PASSWORD}).\n`);
         return;
     }
 
@@ -29,4 +36,3 @@ function main() {
 }
 
 main();
-

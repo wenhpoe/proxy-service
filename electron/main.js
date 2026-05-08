@@ -183,9 +183,16 @@ async function createWindow() {
     if (bootstrap && bootstrap.adminPasswordSource === 'generated' && bootstrap.adminPassword) {
       dialog.showMessageBox({
         type: 'warning',
-        title: '管理员密码未配置',
-        message: '未检测到 PROXY_ADMIN_PASSWORD，已为本次启动生成临时管理员密码。',
-        detail: `临时密码：${bootstrap.adminPassword}\n\n建议：在配置文件中设置固定密码后重启。\n配置文件位置：${bootstrap.envHint || '（未知）'}`,
+        title: '已使用默认管理员密码',
+        message: '未检测到 PROXY_ADMIN_PASSWORD，已使用默认管理员密码 123456。',
+        detail: `当前密码：${bootstrap.adminPassword}\n\n如需修改，请在配置文件中设置 PROXY_ADMIN_PASSWORD 后重启。\n配置文件位置：${bootstrap.envHint || '（未知）'}`,
+      });
+    } else if (bootstrap && bootstrap.adminPasswordSource === 'env-auto-created' && bootstrap.adminPassword) {
+      dialog.showMessageBox({
+        type: 'info',
+        title: '已自动创建配置文件',
+        message: '首次启动已自动创建 .env，默认管理员密码为 123456。',
+        detail: `管理员密码：${bootstrap.adminPassword}\n\n配置文件位置：${bootstrap.envHint || '（未知）'}\n\n后续可直接编辑该文件并重启应用。`,
       });
     }
   } catch {

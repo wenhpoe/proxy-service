@@ -36,9 +36,19 @@ npm run start:server
 - 开发/源码运行：`proxy-service/.env`
 - 打包后（dmg/exe）：`<userData>/.env`（macOS: `~/Library/Application Support/Flow 代理管理服务/.env`；Windows: `%APPDATA%\\Flow 代理管理服务\\.env`）
 
+打包后的应用如果发现 `<userData>/.env` 不存在，会在**首次启动**时自动创建：
+
+- 如果安装包里内置了 `bundled.env`，会自动复制到 `<userData>/.env`
+- 如果安装包里没有内置管理员配置，会自动写入默认 `PROXY_ADMIN_PASSWORD=123456`，并生成 `PROXY_ADMIN_SESSION_SECRET` 到 `<userData>/.env`
+
 ### 打包时“内置 .env”（按你当前 .env 固定管理员认证）
 
 如果你希望 `npm run dist` 打出的安装包**默认就使用你当前仓库里的 `proxy-service/.env`**（不需要另外去 userData 放一份），本项目会在打包前把 `proxy-service/.env` 复制到 `proxy-service/build/bundled.env` 并随安装包一起内置。
+
+如果打包时没有 `proxy-service/.env`，则会自动生成一个内置配置：
+
+- `PROXY_ADMIN_PASSWORD=123456`
+- `PROXY_ADMIN_SESSION_SECRET=构建时随机生成`
 
 这意味着安装包可以同时内置：
 
@@ -53,6 +63,7 @@ npm run start:server
 如果是 GitHub Actions 打包：
 
 - 配置 `PROXY_ADMIN_PASSWORD` secret 后，安装包会默认使用这个固定管理员密码
+- 如果未配置 `PROXY_ADMIN_PASSWORD` secret，workflow 会直接把默认密码 `123456` 写进打包用 `.env`
 - 可选配置 `PROXY_ADMIN_SESSION_SECRET` secret，让不同版本/平台也使用你指定的固定 session 签名 secret
 - 如果未配置 `PROXY_ADMIN_SESSION_SECRET`，workflow 会在构建时自动生成一个并打进该次构建产物里；这样同一个安装包重启后不会因为 secret 变化导致登录失效
 

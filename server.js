@@ -22,6 +22,8 @@ function isElectronRuntime() {
 }
 
 function getUserDataDir() {
+  const override = String(process.env.PROXY_USER_DATA_DIR || '').trim();
+  if (override) return path.resolve(override);
   if (!isElectronRuntime()) return null;
   try {
     const { app } = require('electron');
@@ -40,6 +42,9 @@ function configEnvHintPath() {
 }
 
 let ENV_LOADED_FROM = null;
+let ENV_BOOTSTRAPPED_MODE = null;
+let ENV_BOOTSTRAPPED_PATH = null;
+const DEFAULT_ADMIN_PASSWORD = String(process.env.PROXY_ADMIN_DEFAULT_PASSWORD || '123456').trim() || '123456';
 
 function bundledEnvCandidates() {
   const out = [];
@@ -59,9 +64,90 @@ function bundledEnvCandidates() {
   return out;
 }
 
+function shouldMaterializeUserEnv() {
+  if (!isElectronRuntime()) return false;
+  try {
+    const { app } = require('electron');
+    if (app && app.isPackaged) return true;
+  } catch {
+    // ignore
+  }
+  return String(process.env.PROXY_MATERIALIZE_USER_ENV || '').trim() === '1';
+}
+
+function readTextIfExists(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function renderAutoCreatedEnv({ password, sessionSecret }) {
+  return [
+    '# Auto-created by Flow 代理管理服务 on first launch.',
+    '# You can edit these values and restart the app.',
+    `PROXY_ADMIN_PASSWORD=${password}`,
+    `PROXY_ADMIN_SESSION_SECRET=${sessionSecret}`,
+    '',
+    '# Optional settings',
+    '# PROXY_ADMIN_SESSION_TTL_SEC=43200',
+    '# PROXY_ADMIN_COOKIE_PERSIST=1',
+    '# PROXY_ADMIN_COOKIE_SECURE=1',
+    '',
+  ].join('\n');
+}
+
+function ensureUserEnvMaterialized() {
+  if (!shouldMaterializeUserEnv()) return;
+  const userData = getUserDataDir();
+  if (!userData) return;
+  const dst = path.join(userData, '.env');
+  try {
+    if (fs.existsSync(dst)) return;
+  } catch {
+    // ignore
+  }
+
+  let content = null;
+  let mode = null;
+
+  for (const candidate of bundledEnvCandidates()) {
+    const text = readTextIfExists(candidate);
+    if (text && text.trim()) {
+      content = text;
+      mode = 'copied-bundled';
+      break;
+    }
+  }
+
+  if (!content) {
+    const password = DEFAULT_ADMIN_PASSWORD;
+    const sessionSecret = crypto.randomBytes(32).toString('base64url');
+    content = renderAutoCreatedEnv({ password, sessionSecret });
+    mode = 'generated';
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.writeFileSync(dst, content, 'utf8');
+    ENV_BOOTSTRAPPED_MODE = mode;
+    ENV_BOOTSTRAPPED_PATH = dst;
+    if (mode === 'generated') {
+      console.log(`🔐 首次启动已自动创建固定管理员配置：${dst}`);
+    } else {
+      console.log(`📄 首次启动已写出配置文件：${dst}（来源：bundled.env）`);
+    }
+  } catch (err) {
+    console.warn(`⚠️ 无法创建配置文件 ${dst}: ${err?.message || err}`);
+  }
+}
+
 try {
   // Load .env if present (admin machine friendly).
   // Prefer <userData>/.env (runtime override), then bundled.env (from build time), then proxy-service/.env in dev.
+  ensureUserEnvMaterialized();
   const candidates = [];
   const userData = getUserDataDir();
   if (userData) candidates.push(path.join(userData, '.env'));
@@ -124,16 +210,17 @@ const ACTIVATION_CODE_TTL_SEC_DEFAULT = 60 * 60 * 24; // 1d
 
 let ADMIN_PASSWORD = String(process.env.PROXY_ADMIN_PASSWORD || '').trim();
 let ADMIN_SESSION_SECRET = String(process.env.PROXY_ADMIN_SESSION_SECRET || '').trim();
-const ADMIN_PASSWORD_SOURCE = ADMIN_PASSWORD ? 'env' : 'generated';
+let ADMIN_PASSWORD_SOURCE =
+  ADMIN_PASSWORD && ENV_BOOTSTRAPPED_MODE === 'generated' ? 'env-auto-created' : ADMIN_PASSWORD ? 'env' : 'generated';
 
 if (!ADMIN_PASSWORD) {
-  ADMIN_PASSWORD = crypto.randomBytes(12).toString('base64url');
+  ADMIN_PASSWORD = DEFAULT_ADMIN_PASSWORD;
   try {
     process.env.PROXY_ADMIN_PASSWORD = ADMIN_PASSWORD;
   } catch {
     // ignore
   }
-  console.log('🔐 PROXY_ADMIN_PASSWORD 未设置：已生成临时管理员密码（重启会变）：', ADMIN_PASSWORD);
+  console.log('🔐 PROXY_ADMIN_PASSWORD 未设置：已使用默认管理员密码：', ADMIN_PASSWORD);
 }
 if (!ADMIN_SESSION_SECRET) {
   ADMIN_SESSION_SECRET = crypto.randomBytes(32).toString('base64url');
@@ -3932,7 +4019,12 @@ function getBootstrapInfo() {
     envHint: configEnvHintPath(),
     adminPasswordSource: ADMIN_PASSWORD_SOURCE,
     // Only for Electron main process usage; do NOT expose this in HTTP endpoints.
-    adminPassword: ADMIN_PASSWORD_SOURCE === 'generated' ? ADMIN_PASSWORD : null,
+    adminPassword:
+      ADMIN_PASSWORD_SOURCE === 'generated' || ADMIN_PASSWORD_SOURCE === 'env-auto-created'
+        ? ADMIN_PASSWORD
+        : null,
+    envBootstrapMode: ENV_BOOTSTRAPPED_MODE,
+    envBootstrapPath: ENV_BOOTSTRAPPED_PATH,
     storePath: STORE_PATH,
     accountsDir: ACCOUNTS_DIR,
   };

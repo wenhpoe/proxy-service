@@ -404,6 +404,26 @@
         return document.querySelector(".tablebox");
       }
 
+      function resetTableCardScroll() {
+        const tbody = $("tbody");
+        const card =
+          (tbody && typeof tbody.closest === "function"
+            ? tbody.closest('section.card[aria-label="代理池列表"]')
+            : null) || document.querySelector('section.card[aria-label="代理池列表"]');
+        if (!card) return;
+        try {
+          card.scrollTop = 0;
+          card.scrollLeft = 0;
+          const body = card.querySelector(".card-b");
+          if (body) {
+            body.scrollTop = 0;
+            body.scrollLeft = 0;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       function getTableScrollState() {
         const box = getTableBox();
         if (!box) return { top: 0, left: 0 };
@@ -418,6 +438,7 @@
         if (!box) return;
         const apply = () => {
           try {
+            resetTableCardScroll();
             const maxTop = Math.max(0, box.scrollHeight - box.clientHeight);
             const maxLeft = Math.max(0, box.scrollWidth - box.clientWidth);
             const nextTop = state && Number.isFinite(Number(state.top)) ? Number(state.top) : Number(box.scrollTop || 0);

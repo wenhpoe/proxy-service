@@ -91,7 +91,7 @@
             if (src === "generated") {
               hint.hidden = false;
               hint.className = "status warn";
-              hint.textContent = `管理员密码未配置：请在配置文件中设置 PROXY_ADMIN_PASSWORD 后重启。配置文件：${h?.envHint || "（未知）"}`;
+              hint.textContent = `管理员密码未配置：当前默认密码为 123456。你也可以在配置文件中设置 PROXY_ADMIN_PASSWORD 后重启。配置文件：${h?.envHint || "（未知）"}`;
             } else {
               hint.hidden = true;
               hint.textContent = "";

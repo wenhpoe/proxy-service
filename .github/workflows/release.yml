@@ -51,19 +51,20 @@ jobs:
           PROXY_ADMIN_PASSWORD: ${{ secrets.PROXY_ADMIN_PASSWORD }}
           PROXY_ADMIN_SESSION_SECRET: ${{ secrets.PROXY_ADMIN_SESSION_SECRET }}
         run: |
+          BUNDLED_PASSWORD="${PROXY_ADMIN_PASSWORD:-123456}"
+          SESSION_SECRET="${PROXY_ADMIN_SESSION_SECRET}"
+          if [ -z "${SESSION_SECRET}" ]; then
+            SESSION_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
+            echo "ℹ️ PROXY_ADMIN_SESSION_SECRET not set; generated one for this build"
+          fi
+          {
+            echo "PROXY_ADMIN_PASSWORD=${BUNDLED_PASSWORD}"
+            echo "PROXY_ADMIN_SESSION_SECRET=${SESSION_SECRET}"
+          } > .env
           if [ -n "${PROXY_ADMIN_PASSWORD}" ]; then
-            SESSION_SECRET="${PROXY_ADMIN_SESSION_SECRET}"
-            if [ -z "${SESSION_SECRET}" ]; then
-              SESSION_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
-              echo "ℹ️ PROXY_ADMIN_SESSION_SECRET not set; generated one for this build"
-            fi
-            {
-              echo "PROXY_ADMIN_PASSWORD=${PROXY_ADMIN_PASSWORD}"
-              echo "PROXY_ADMIN_SESSION_SECRET=${SESSION_SECRET}"
-            } > .env
-            echo "✅ wrote .env for bundling (password + session secret)"
+            echo "✅ wrote .env for bundling (password from secret + session secret)"
           else
-            echo "ℹ️ PROXY_ADMIN_PASSWORD not set; packaged app will auto-generate on first start"
+            echo "✅ wrote .env for bundling (default password 123456 + generated session secret)"
           fi
 
       - name: Import macOS code signing certificate (optional)
