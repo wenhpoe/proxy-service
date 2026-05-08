@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>任务管理 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/nav.js" defer></script>
+    <script src="/time.js" defer></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>任务管理</h1>
+          <div class="sub">
+            查看共享任务队列、批次和错误；第一版只保留必要排障能力：筛选、取消、重试、查看 slot / 账号 / 错误信息。
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnLogout">退出</button>
+          <div class="pill" title="服务状态">
+            <span class="led" id="led"></span>
+            <span class="mono" id="pillText">检查中…</span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid">
+        <section class="card" aria-label="任务列表" style="grid-column: 1 / -1">
+          <div class="card-h">
+            <h2>任务</h2>
+            <div class="row">
+              <input class="input" id="machineId" placeholder="machineId" style="width: 210px" />
+              <select id="taskStatus" style="width: 160px">
+                <option value="">全部状态</option>
+                <option value="queued">queued</option>
+                <option value="running">running</option>
+                <option value="cancel_requested">cancel_requested</option>
+                <option value="succeeded">succeeded</option>
+                <option value="failed">failed</option>
+                <option value="cancelled">cancelled</option>
+                <option value="expired">expired</option>
+              </select>
+              <select id="taskType" style="width: 120px">
+                <option value="">全部类型</option>
+                <option value="image">image</option>
+                <option value="video">video</option>
+              </select>
+              <input class="input" id="batchId" placeholder="batchId" style="width: 240px" />
+              <select id="taskLimit" style="width: 110px">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="status" id="status" hidden></div>
+            <div class="tablebox" style="max-height: 54vh">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width: 210px">任务</th>
+                    <th style="width: 170px">机器</th>
+                    <th style="width: 90px">类型</th>
+                    <th style="width: 140px">状态</th>
+                    <th style="width: 90px">优先级</th>
+                    <th style="width: 110px">尝试</th>
+                    <th style="width: 180px">账号 / slot</th>
+                    <th>错误 / 结果</th>
+                    <th style="width: 180px">更新时间</th>
+                    <th style="width: 170px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="tasksTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="card" aria-label="批次列表" style="grid-column: 1 / -1">
+          <div class="card-h">
+            <h2>批次</h2>
+            <div class="row">
+              <select id="batchStatus" style="width: 170px">
+                <option value="">全部状态</option>
+                <option value="queued">queued</option>
+                <option value="running">running</option>
+                <option value="succeeded">succeeded</option>
+                <option value="partial_failed">partial_failed</option>
+                <option value="cancelled">cancelled</option>
+                <option value="expired">expired</option>
+              </select>
+              <select id="batchLimit" style="width: 110px">
+                <option value="20">20</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+              </select>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="tablebox" style="max-height: 34vh">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width: 220px">批次</th>
+                    <th style="width: 170px">机器</th>
+                    <th style="width: 140px">状态</th>
+                    <th style="width: 90px">优先级</th>
+                    <th style="width: 110px">任务数</th>
+                    <th style="width: 180px">过期时间</th>
+                    <th style="width: 180px">更新时间</th>
+                  </tr>
+                </thead>
+                <tbody id="batchesTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      async function j(url, opts) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+          throw new Error("未登录");
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
+        return data;
+      }
+
+      function esc(value) {
+        return String(value || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function ts(value) {
+        try {
+          return window.fmaFmtChinaTime ? window.fmaFmtChinaTime(value) : String(value || "—");
+        } catch {
+          return String(value || "—");
+        }
+      }
+
+      function pill(kind, text) {
+        $("led").style.background =
+          kind === "ok" ? "#17c964" : kind === "warn" ? "#f5a524" : kind === "err" ? "#f31260" : "#9aa4b2";
+        $("pillText").textContent = text;
+      }
+
+      function setStatus(kind, text, { autoHideMs = 4500 } = {}) {
+        const el = $("status");
+        if (!text) {
+          el.hidden = true;
+          el.className = "status";
+          el.textContent = "";
+          return;
+        }
+        el.hidden = false;
+        el.className = `status ${kind || ""}`.trim();
+        el.textContent = text;
+        if (autoHideMs > 0) {
+          clearTimeout(setStatus._t);
+          setStatus._t = setTimeout(() => setStatus("", ""), autoHideMs);
+        }
+      }
+
+      const state = {
+        tasks: [],
+        batches: [],
+      };
+
+      function taskFilters() {
+        const params = new URLSearchParams();
+        const machineId = $("machineId").value.trim();
+        const status = $("taskStatus").value;
+        const taskType = $("taskType").value;
+        const batchId = $("batchId").value.trim();
+        const limit = $("taskLimit").value;
+        if (machineId) params.set("machineId", machineId);
+        if (status) params.set("status", status);
+        if (taskType) params.set("taskType", taskType);
+        if (batchId) params.set("batchId", batchId);
+        if (limit) params.set("limit", limit);
+        return params.toString();
+      }
+
+      function batchFilters() {
+        const params = new URLSearchParams();
+        const machineId = $("machineId").value.trim();
+        const status = $("batchStatus").value;
+        const limit = $("batchLimit").value;
+        if (machineId) params.set("machineId", machineId);
+        if (status) params.set("status", status);
+        if (limit) params.set("limit", limit);
+        return params.toString();
+      }
+
+      function renderTasks() {
+        const tbody = $("tasksTbody");
+        const rows = Array.isArray(state.tasks) ? state.tasks : [];
+        if (!rows.length) {
+          tbody.innerHTML = `<tr><td colspan="10"><div class="hint">暂无任务</div></td></tr>`;
+          return;
+        }
+        tbody.innerHTML = rows
+          .map((task) => {
+            const errorText = task.errorMessage || task.errorCode || "—";
+            const slotText = task.claimedBySlotId ? `slot#${task.claimedBySlotId}` : "—";
+            const accountText = task.requiredAccountProfile || "动态分配";
+            const attempts = `${task.attemptCount || 0}/${task.maxAttempts || 0}`;
+            const canRetry = ["failed", "cancelled", "expired"].includes(String(task.status || ""));
+            const canCancel = ["queued", "running", "cancel_requested"].includes(String(task.status || ""));
+            return `
+              <tr>
+                <td>
+                  <div class="mono">${esc(task.id)}</div>
+                  <div class="hint mono">batch: ${esc(task.batchId)}</div>
+                </td>
+                <td><span class="mono">${esc(task.targetMachineId || "—")}</span></td>
+                <td>${esc(task.taskType || "—")}</td>
+                <td><span class="tag">${esc(task.status || "—")}</span></td>
+                <td>${esc(task.priority || 0)}</td>
+                <td>${esc(attempts)}</td>
+                <td>
+                  <div>${esc(accountText)}</div>
+                  <div class="hint mono">${esc(slotText)}</div>
+                </td>
+                <td>
+                  <div>${esc(errorText)}</div>
+                  <div class="hint mono">${esc(JSON.stringify(task.resultPayload || {})).slice(0, 120)}</div>
+                </td>
+                <td>${esc(ts(task.updatedAt || task.createdAt))}</td>
+                <td>
+                  <div class="row">
+                    <button class="btn" data-copy-task="${esc(task.id)}">复制 ID</button>
+                    <button class="btn" data-retry-task="${esc(task.id)}" ${canRetry ? "" : "disabled"}>重试</button>
+                    <button class="btn danger" data-cancel-task="${esc(task.id)}" ${canCancel ? "" : "disabled"}>取消</button>
+                  </div>
+                </td>
+              </tr>
+            `;
+          })
+          .join("");
+      }
+
+      function renderBatches() {
+        const tbody = $("batchesTbody");
+        const rows = Array.isArray(state.batches) ? state.batches : [];
+        if (!rows.length) {
+          tbody.innerHTML = `<tr><td colspan="7"><div class="hint">暂无批次</div></td></tr>`;
+          return;
+        }
+        tbody.innerHTML = rows
+          .map(
+            (batch) => `
+              <tr>
+                <td class="mono">${esc(batch.id)}</td>
+                <td class="mono">${esc(batch.targetMachineId || "—")}</td>
+                <td><span class="tag">${esc(batch.status || "—")}</span></td>
+                <td>${esc(batch.priority || 0)}</td>
+                <td>${esc(batch.taskCount || 0)}</td>
+                <td>${esc(ts(batch.expireAt))}</td>
+                <td>${esc(ts(batch.updatedAt || batch.createdAt))}</td>
+              </tr>
+            `,
+          )
+          .join("");
+      }
+
+      async function refreshAll({ silent = false } = {}) {
+        if (!silent) setStatus("warn", "刷新中…", { autoHideMs: 0 });
+        try {
+          const [tasksResp, batchesResp] = await Promise.all([
+            j(`/v1/admin/tasks?${taskFilters()}`),
+            j(`/v1/admin/task-batches?${batchFilters()}`),
+          ]);
+          state.tasks = Array.isArray(tasksResp.tasks) ? tasksResp.tasks : [];
+          state.batches = Array.isArray(batchesResp.batches) ? batchesResp.batches : [];
+          renderTasks();
+          renderBatches();
+          pill("ok", "任务系统在线");
+          if (!silent) setStatus("ok", `已刷新：${state.tasks.length} 个任务 / ${state.batches.length} 个批次`);
+        } catch (err) {
+          pill("err", "任务系统异常");
+          if (!silent) setStatus("err", err.message || "刷新失败", { autoHideMs: 8000 });
+        }
+      }
+
+      async function postTaskAction(taskId, action) {
+        await j(`/v1/admin/tasks/${encodeURIComponent(taskId)}/${action}`, { method: "POST" });
+        await refreshAll({ silent: true });
+      }
+
+      async function copyText(text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      $("btnRefresh").addEventListener("click", () => refreshAll());
+      $("btnLogout").addEventListener("click", async () => {
+        try {
+          await fetch("/auth/logout", { method: "POST" });
+        } finally {
+          location.href = "/login.html";
+        }
+      });
+
+      for (const id of ["machineId", "taskStatus", "taskType", "batchId", "taskLimit", "batchStatus", "batchLimit"]) {
+        $(id).addEventListener("change", () => refreshAll({ silent: true }));
+      }
+      $("machineId").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") refreshAll();
+      });
+      $("batchId").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") refreshAll();
+      });
+
+      $("tasksTbody").addEventListener("click", async (e) => {
+        const copyBtn = e.target.closest("[data-copy-task]");
+        if (copyBtn) {
+          const ok = await copyText(copyBtn.getAttribute("data-copy-task") || "");
+          setStatus(ok ? "ok" : "warn", ok ? "已复制任务 ID" : "复制失败");
+          return;
+        }
+        const retryBtn = e.target.closest("[data-retry-task]");
+        if (retryBtn) {
+          try {
+            await postTaskAction(retryBtn.getAttribute("data-retry-task") || "", "retry");
+            setStatus("ok", "已重试任务");
+          } catch (err) {
+            setStatus("err", err.message || "重试失败");
+          }
+          return;
+        }
+        const cancelBtn = e.target.closest("[data-cancel-task]");
+        if (cancelBtn) {
+          try {
+            await postTaskAction(cancelBtn.getAttribute("data-cancel-task") || "", "cancel");
+            setStatus("ok", "已发送取消请求");
+          } catch (err) {
+            setStatus("err", err.message || "取消失败");
+          }
+        }
+      });
+
+      window.addEventListener("pageshow", () => refreshAll({ silent: true }));
+      refreshAll();
+      setInterval(() => refreshAll({ silent: true }), 5000);
+    </script>
+  </body>
+</html>

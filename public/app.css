@@ -344,6 +344,21 @@ a {
   align-items: center;
 }
 
+.machine-note-cell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.machine-select-cell {
+  text-align: center;
+}
+
+.machine-actions {
+  flex-wrap: wrap;
+}
+
 .btn {
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.52);
@@ -781,6 +796,48 @@ summary {
   justify-content: space-between;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.modal-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 14px;
+  align-items: start;
+}
+
+.modal-pane {
+  border: 1px solid rgba(23, 29, 26, 0.10);
+  border-radius: 16px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.56);
+}
+
+.modal-side {
+  position: sticky;
+  top: 0;
+}
+
+.modal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+@media (max-width: 1020px) {
+  .modal-grid {
+    grid-template-columns: 1fr;
+  }
+  .modal-side {
+    position: static;
+  }
 }
 
 .list {

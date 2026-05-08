@@ -100,6 +100,10 @@
                 autocomplete="off"
                 title="检测超时（毫秒）。vless 默认 TCP 连接；hysteria2 默认 DNS 解析。"
               />
+              <span class="chip" title="当前勾选数量"><span class="mono">已选</span> <strong id="selCount">0</strong></span>
+              <button class="btn" id="btnBulkEnable" title="启用勾选节点">启用</button>
+              <button class="btn" id="btnBulkDisable" title="禁用勾选节点">禁用</button>
+              <button class="btn danger" id="btnBulkDelete" title="删除勾选节点">删除</button>
               <button class="btn" id="btnCheckAll" title="对当前筛选结果逐个检测">一键检测</button>
               <select id="pageSize" style="width: 110px"></select>
             </div>
@@ -109,6 +113,11 @@
               <table>
                 <thead>
                   <tr>
+                    <th style="width: 56px">
+                      <label class="check" title="全选/取消全选（当前页）">
+                        <input type="checkbox" id="chkAllPage" />
+                      </label>
+                    </th>
                     <th style="width: 84px">启用</th>
                     <th>节点</th>
                     <th style="width: 220px">标签</th>
@@ -219,6 +228,69 @@
       let checkInited = false;
       let queryInited = false;
       let focusId = "";
+      const selectedIds = new Set();
+
+      function setSelCount() {
+        const el = $("selCount");
+        if (el) el.textContent = String(selectedIds.size || 0);
+      }
+
+      function getSelectedList() {
+        return Array.from(selectedIds.values())
+          .map((s) => String(s || "").trim())
+          .filter(Boolean);
+      }
+
+      async function bulkSetEnabled(enabled) {
+        const ids = getSelectedList();
+        if (!ids.length) {
+          setStatus("warn", "请先勾选要操作的节点。", { autoHideMs: 2500 });
+          return;
+        }
+        setStatus("warn", `正在批量${enabled ? "启用" : "禁用"} ${ids.length} 个节点…`, { autoHideMs: 0 });
+        let ok = 0;
+        let fail = 0;
+        for (const id of ids) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await setEnabled(id, !!enabled);
+            ok += 1;
+          } catch {
+            fail += 1;
+          }
+        }
+        selectedIds.clear();
+        setSelCount();
+        await refresh();
+        setStatus(fail ? "warn" : "good", `批量${enabled ? "启用" : "禁用"}完成：成功 ${ok}，失败 ${fail}`, {
+          autoHideMs: fail ? 9000 : 4500,
+        });
+      }
+
+      async function bulkDelete() {
+        const ids = getSelectedList();
+        if (!ids.length) {
+          setStatus("warn", "请先勾选要删除的节点。", { autoHideMs: 2500 });
+          return;
+        }
+        if (!confirm(`确认删除勾选的 ${ids.length} 个节点吗？（会同步从代理池/账号策略中清理引用）`)) return;
+        setStatus("warn", `正在批量删除 ${ids.length} 个节点…`, { autoHideMs: 0 });
+        let ok = 0;
+        let fail = 0;
+        for (const id of ids) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await delItem(id);
+            ok += 1;
+          } catch {
+            fail += 1;
+          }
+        }
+        selectedIds.clear();
+        setSelCount();
+        await refresh();
+        setStatus(fail ? "warn" : "good", `批量删除完成：成功 ${ok}，失败 ${fail}`, { autoHideMs: fail ? 9000 : 4500 });
+      }
 
       function getQueryParams() {
         try {
@@ -285,7 +357,7 @@
         tbody.innerHTML = "";
         if (!filtered.length) {
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td colspan="4" style="padding:14px">
+          tr.innerHTML = `<td colspan="5" style="padding:14px">
             <div class="sub">没有匹配项。</div>
             <div class="meta">可以试试清空搜索或切换国家筛选。</div>
           </td>`;
@@ -294,6 +366,7 @@
         }
 
         for (const it of pageItems) {
+          const isSel = selectedIds.has(String(it.id || ""));
           const title = `${it.country || "其他"} · ${it.protocol || "?"} · ${it.host || "?"}:${it.port || "?"}`;
           const remark = it.remark || it.label || "（无备注）";
           const link = it.fullLink || "";
@@ -326,6 +399,11 @@
           const tr = document.createElement("tr");
           tr.dataset.nodeId = String(it.id || "");
           tr.innerHTML = `
+            <td>
+              <label class="check" title="勾选用于批量操作">
+                <input type="checkbox" data-sel="${esc(it.id)}" ${isSel ? "checked" : ""} />
+              </label>
+            </td>
             <td>
               <div class="switch">
                 <input class="hidden" type="checkbox" id="en_${esc(
@@ -397,6 +475,13 @@
           tbody.appendChild(tr);
         }
         highlightFocusRow();
+        setSelCount();
+        const chk = $("chkAllPage");
+        if (chk) {
+          const ids = pageItems.map((x) => String(x?.id || "")).filter(Boolean);
+          chk.checked = ids.length > 0 && ids.every((id) => selectedIds.has(id));
+          chk.indeterminate = ids.some((id) => selectedIds.has(id)) && !chk.checked;
+        }
       }
 
       function fillCountryOptions(countries, selected) {
@@ -590,7 +675,8 @@
       }
 
       async function checkAll() {
-        const list = getFilteredItems();
+        const selected = getSelectedList();
+        const list = selected.length ? selected.map((id) => ({ id })) : getFilteredItems();
         if (!list.length) return setStatus("warn", "没有可检测的节点", { autoHideMs: 2500 });
 
         const btn = $("btnCheckAll");
@@ -631,6 +717,18 @@
         $("subFileName").textContent = f ? f.name : "—";
       });
       $("btnCheckAll").addEventListener("click", checkAll);
+      $("btnBulkEnable").addEventListener("click", () => bulkSetEnabled(true));
+      $("btnBulkDisable").addEventListener("click", () => bulkSetEnabled(false));
+      $("btnBulkDelete").addEventListener("click", bulkDelete);
+      $("chkAllPage").addEventListener("change", (e) => {
+        const on = !!e.target.checked;
+        const filtered = getFilteredItems();
+        const pageItems = pager ? pager.slice(filtered) : filtered;
+        const ids = pageItems.map((x) => String(x?.id || "")).filter(Boolean);
+        if (on) ids.forEach((id) => selectedIds.add(id));
+        else ids.forEach((id) => selectedIds.delete(id));
+        render();
+      });
       $("btnOnlyEnabled").addEventListener("click", () => {
         state.onlyEnabled = !state.onlyEnabled;
         $("btnOnlyEnabled").setAttribute("aria-pressed", String(state.onlyEnabled));
@@ -679,6 +777,14 @@
       });
 
       document.addEventListener("change", async (e) => {
+        const sel = e.target.closest("input[data-sel]");
+        if (sel) {
+          const id = String(sel.getAttribute("data-sel") || "");
+          if (sel.checked) selectedIds.add(id);
+          else selectedIds.delete(id);
+          setSelCount();
+          return;
+        }
         const en = e.target.closest("input[data-enable]");
         if (!en) return;
         const id = en.getAttribute("data-enable");

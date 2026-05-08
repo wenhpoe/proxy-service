@@ -125,12 +125,19 @@
             <div class="row">
               <input class="input mono" id="policyProfile" placeholder="账号名称（例如 269）" style="width: 220px" />
               <button class="btn" id="btnPolicyLoad">加载</button>
+              <button class="btn" id="btnPolicyExplain" disabled>策略预览</button>
               <button class="btn primary" id="btnPolicySave" disabled>保存策略</button>
               <button class="btn danger" id="btnPolicyClear" disabled>清除策略</button>
               <span class="chip"><span class="mono" id="policyInfo">—</span></span>
             </div>
 
             <div class="status" id="statusPolicy" hidden></div>
+
+            <details id="policyExplainBox" hidden style="margin-top: 10px">
+              <summary>策略预览/解释</summary>
+              <div style="height: 10px"></div>
+              <div id="policyExplainBody"></div>
+            </details>
 
             <div style="height: 12px"></div>
             <div class="cols2">
@@ -275,6 +282,7 @@
         $("policyInfo").textContent = extra ? `${base} · ${extra}` : base;
         $("btnPolicySave").disabled = !name || n === 0;
         $("btnPolicyClear").disabled = !name;
+        $("btnPolicyExplain").disabled = !name;
       }
 
       function renderPolicyPool() {
@@ -459,6 +467,110 @@
         renderPolicySelected();
       }
 
+      function renderPolicyExplain(data) {
+        const box = $("policyExplainBox");
+        const host = $("policyExplainBody");
+        if (!box || !host) return;
+
+        host.innerHTML = "";
+        if (!data || data.ok !== true) {
+          box.hidden = true;
+          return;
+        }
+
+        box.hidden = false;
+
+        const explain = data.explain || {};
+        const items = Array.isArray(data.items) ? data.items : [];
+        const note = String(explain.note || "").trim();
+
+        const summary = document.createElement("div");
+        summary.className = "meta";
+        summary.textContent = [
+          `策略条目 ${Number(explain.policyItems) || 0}`,
+          `可用 ${Number(explain.policyUsable) || 0}`,
+          `缺失 ${Number(explain.policyMissing) || 0}`,
+          `禁用 ${Number(explain.policyDisabled) || 0}`,
+          `不可用 ${Number(explain.policyUnusable) || 0}`,
+          explain.bestPriority != null ? `最佳优先级 ${explain.bestPriority}` : "最佳优先级 —",
+          Array.isArray(explain.bucket) && explain.bucket.length ? `候选 ${explain.bucket.length}` : "候选 —",
+          explain.stickyPoolItemId ? `sticky ${String(explain.stickyPoolItemId)}` : null,
+          explain.wouldPickPoolItemId ? `会选 ${String(explain.wouldPickPoolItemId)}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+
+        host.appendChild(summary);
+
+        if (note) {
+          const n = document.createElement("div");
+          n.className = "status warn";
+          n.textContent = note;
+          host.appendChild(n);
+        }
+
+        const wrap = document.createElement("div");
+        wrap.className = "tablebox";
+        wrap.style.maxHeight = "340px";
+        wrap.innerHTML = `
+          <table>
+            <thead>
+              <tr>
+                <th>条目</th>
+                <th style="width: 110px">优先级</th>
+                <th style="width: 120px">状态</th>
+                <th style="width: 240px">原因</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        `;
+        const tbody = wrap.querySelector("tbody");
+        for (const it of items) {
+          const tr = document.createElement("tr");
+          const id = String(it.poolItemId || "");
+          const label = String(it.label || "").trim() || "—";
+          const kind = it.kind ? String(it.kind) : "—";
+          const priority = Number.isFinite(it.priority) ? String(it.priority) : "0";
+          const enabled = it.enabled ? "启用" : "禁用";
+          const usable = it.usable ? "可用" : "不可用";
+          const badge = it.usable ? "good" : it.enabled ? "warn" : "bad";
+          const reasons = Array.isArray(it.reasons) ? it.reasons : [];
+          const reasonText = reasons.length ? reasons.join(", ") : "—";
+
+          tr.innerHTML = `
+            <td>
+              <div style="font-weight:650">${esc(label)}</div>
+              <div class="meta mono">${esc(kind)} · ${esc(id)}</div>
+            </td>
+            <td class="mono">${esc(priority)}</td>
+            <td><span class="badge ${esc(badge)}">${esc(`${usable} / ${enabled}`)}</span></td>
+            <td class="mono">${esc(reasonText)}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+        host.appendChild(wrap);
+      }
+
+      async function explainPolicy(profileName) {
+        const name = String(profileName || $("policyProfile").value || "").trim();
+        if (!name) return setStatus("statusPolicy", "warn", "请输入账号名称");
+        try {
+          setStatus("statusPolicy", "warn", "生成策略预览…");
+          const r = await j(`/v1/proxy-policy/${encodeURIComponent(name)}/explain`);
+          renderPolicyExplain(r);
+          try {
+            $("policyExplainBox").open = true;
+          } catch {
+            // ignore
+          }
+          setStatus("statusPolicy", "good", "策略预览已更新");
+        } catch (e) {
+          $("policyExplainBox").hidden = true;
+          setStatus("statusPolicy", "bad", e.message || "预览失败");
+        }
+      }
+
       async function loadPolicy(profileName) {
         const name = String(profileName || $("policyProfile").value || "").trim();
         if (!name) return setStatus("statusPolicy", "warn", "请输入账号名称");
@@ -476,6 +588,7 @@
             .filter((x) => x.poolItemId);
           state.policyLoadedFor = name;
           setStatus("statusPolicy", "good", `已加载：${name}`);
+          $("policyExplainBox").hidden = true;
           renderPolicyPool();
           renderPolicySelected();
           renderPolicyInfo(r?.policy?.updatedAt ? `策略 ${r.policy.updatedAt}` : null);
@@ -484,6 +597,7 @@
           state.selectedPolicyItems = [];
           renderPolicyPool();
           renderPolicySelected();
+          $("policyExplainBox").hidden = true;
           renderPolicyInfo();
           setStatus("statusPolicy", "bad", e.message || "加载失败");
         }
@@ -505,6 +619,11 @@
           });
           setStatus("statusPolicy", "good", `已保存：${name}`);
           await loadPolicy(name);
+          try {
+            await explainPolicy(name);
+          } catch {
+            // ignore
+          }
         } catch (e) {
           setStatus("statusPolicy", "bad", e.message || "保存失败");
         }
@@ -520,6 +639,7 @@
           state.policyLoadedFor = name;
           renderPolicyPool();
           renderPolicySelected();
+          $("policyExplainBox").hidden = true;
           renderPolicyInfo("已清除");
           setStatus("statusPolicy", "good", `已清除：${name}`);
         } catch (e) {
@@ -723,6 +843,7 @@
         }
       });
       $("btnPolicyLoad").addEventListener("click", async () => loadPolicy());
+      $("btnPolicyExplain").addEventListener("click", async () => explainPolicy());
       $("btnPolicySave").addEventListener("click", async () => savePolicy());
       $("btnPolicyClear").addEventListener("click", async () => clearPolicy());
 

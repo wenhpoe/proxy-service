@@ -43,9 +43,9 @@ base64 -i signing-cert.p12 | pbcopy
 然后粘贴到 GitHub：
 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`。
 
-### 0.2 （可选）设置默认管理员密码（推荐）
+### 0.2 （可选）设置默认管理员认证（推荐）
 
-`proxy-service` 打包时支持把 `.env` 打进安装包（用于默认管理员密码）。
+`proxy-service` 打包时支持把 `.env` 打进安装包（用于默认管理员密码和 session secret）。
 
 最推荐的方式：在 GitHub 仓库里配置 Actions Secret：
 
@@ -53,8 +53,14 @@ base64 -i signing-cert.p12 | pbcopy
 2) 新建 `Repository secret`
 3) 名称：`PROXY_ADMIN_PASSWORD`
 4) 值：你的管理员密码
+5) 可选再加一个：`PROXY_ADMIN_SESSION_SECRET`
+6) 值：随机长字符串（用于签名管理员 session）
 
 之后每次打包，workflow 会写入 `.env` 并由构建脚本打包进 `build/bundled.env`。
+
+- `PROXY_ADMIN_PASSWORD` 决定安装包里的默认登录密码
+- `PROXY_ADMIN_SESSION_SECRET` 决定安装包里的固定 session 签名 secret
+- 如果你没配 `PROXY_ADMIN_SESSION_SECRET`，workflow 会在构建时自动生成一个并打包进去，所以同一个安装包重启后不会因为 secret 变化而掉登录态
 
 如果你不配置这个 secret：打包后的首次启动会自动生成临时管理员密码（并弹窗提示）。
 

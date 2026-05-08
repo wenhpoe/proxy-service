@@ -45,14 +45,23 @@ jobs:
             exit 1
           fi
 
-      - name: Write .env (optional, for bundled admin password)
+      - name: Write .env (optional, for bundled admin auth)
         shell: bash
         env:
           PROXY_ADMIN_PASSWORD: ${{ secrets.PROXY_ADMIN_PASSWORD }}
+          PROXY_ADMIN_SESSION_SECRET: ${{ secrets.PROXY_ADMIN_SESSION_SECRET }}
         run: |
           if [ -n "${PROXY_ADMIN_PASSWORD}" ]; then
-            echo "PROXY_ADMIN_PASSWORD=${PROXY_ADMIN_PASSWORD}" > .env
-            echo "✅ wrote .env for bundling"
+            SESSION_SECRET="${PROXY_ADMIN_SESSION_SECRET}"
+            if [ -z "${SESSION_SECRET}" ]; then
+              SESSION_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
+              echo "ℹ️ PROXY_ADMIN_SESSION_SECRET not set; generated one for this build"
+            fi
+            {
+              echo "PROXY_ADMIN_PASSWORD=${PROXY_ADMIN_PASSWORD}"
+              echo "PROXY_ADMIN_SESSION_SECRET=${SESSION_SECRET}"
+            } > .env
+            echo "✅ wrote .env for bundling (password + session secret)"
           else
             echo "ℹ️ PROXY_ADMIN_PASSWORD not set; packaged app will auto-generate on first start"
           fi

@@ -7,6 +7,7 @@ const dns = require('dns');
 const net = require('net');
 
 const { parseSubscriptionToNodes } = require('./decode-sub');
+const taskSystem = require('./core/taskSystem');
 let YAML = null;
 try {
   // Optional dependency for YAML file import (Clash config).
@@ -350,7 +351,46 @@ function writeStore(next) {
     machines: next.machines && typeof next.machines === 'object' ? next.machines : {},
   };
   writeFileAtomicSync(STORE_PATH, JSON.stringify(payload, null, 2));
+  taskSystem.mirrorStoreSnapshot(payload).catch((err) => {
+    const msg = err && err.message ? String(err.message) : String(err);
+    console.warn(`⚠️ MySQL store mirror failed: ${msg}`);
+  });
   return payload;
+}
+
+function collectLegacyAccountStatesForMirror() {
+  const out = {};
+  try {
+    for (const item of listAccountProfiles()) {
+      const name = item && item.name ? String(item.name) : '';
+      if (!name) continue;
+      try {
+        out[name] = readAccountStorageState(name);
+      } catch {
+        // ignore individual corrupt account files
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return out;
+}
+
+let TASK_BOOTSTRAP_PROMISE = null;
+
+function ensureTaskSystemBootstrap() {
+  if (TASK_BOOTSTRAP_PROMISE) return TASK_BOOTSTRAP_PROMISE;
+  TASK_BOOTSTRAP_PROMISE = (async () => {
+    await taskSystem.ensureSchema();
+    await taskSystem.bootstrapLegacyMirror({
+      store: readStore(),
+      accounts: collectLegacyAccountStatesForMirror(),
+    });
+  })().catch((err) => {
+    TASK_BOOTSTRAP_PROMISE = null;
+    throw err;
+  });
+  return TASK_BOOTSTRAP_PROMISE;
 }
 
 let STORE_PATCH_QUEUE = Promise.resolve();
@@ -716,6 +756,29 @@ function clampString(s, maxLen) {
 
 function safeArray(v) {
   return Array.isArray(v) ? v : [];
+}
+
+function normalizeMachineNote(v) {
+  return clampString(v, 160);
+}
+
+function normalizeMachineWorkerLimit(v, fallback = 7) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+}
+
+function normalizeAllowedProfilesInput(body) {
+  const hasAllowedProfiles =
+    Array.isArray(body?.allowedProfiles) || typeof body?.allowedProfilesText === 'string';
+  const allowedProfiles = hasAllowedProfiles
+    ? Array.isArray(body?.allowedProfiles)
+      ? body.allowedProfiles.map((s) => String(s).trim()).filter(Boolean)
+      : body.allowedProfilesText
+          .split(/\r?\n/g)
+          .map((s) => s.trim())
+          .filter(Boolean)
+    : null;
+  return { hasAllowedProfiles, allowedProfiles };
 }
 
 function clashProxyToShareLink(proxy) {
@@ -1417,6 +1480,10 @@ function readAccountStorageState(profile) {
 function writeAccountStorageState(profile, storageState) {
   const fp = accountFilePath(profile);
   writeFileAtomicSync(fp, JSON.stringify(storageState, null, 2));
+  taskSystem.mirrorAccountStorageState(profile, storageState, { source: 'capture' }).catch((err) => {
+    const msg = err && err.message ? String(err.message) : String(err);
+    console.warn(`⚠️ MySQL account mirror failed for ${profile}: ${msg}`);
+  });
   return fp;
 }
 
@@ -1460,6 +1527,29 @@ function authClient(req, res, next) {
   writeStore(store);
   req.clientMachine = { machineId, ...m };
   return next();
+}
+
+function taskApiStatusFromError(err, fallback = 500) {
+  const msg = err && err.message ? String(err.message) : String(err || '');
+  if (!msg) return fallback;
+  if (msg === 'mysql disabled') return 503;
+  if (msg.includes('not found')) return 404;
+  if (
+    msg.includes('required') ||
+    msg.includes('invalid') ||
+    msg.includes('unsupported') ||
+    msg.includes('taskType') ||
+    msg.includes('expireAt')
+  ) {
+    return 400;
+  }
+  return fallback;
+}
+
+function sendTaskApiError(res, err, fallback = 500) {
+  const status = taskApiStatusFromError(err, fallback);
+  const msg = err && err.message ? String(err.message) : String(err || 'task api error');
+  return res.status(status).json({ ok: false, error: msg });
 }
 
 function extractProxyCandidates(data) {
@@ -2641,11 +2731,16 @@ app.post('/v1/client/activate', (req, res) => {
 
   const token = crypto.randomBytes(24).toString('base64url');
   const tokenHash = sha256Hex(token);
+  const prevMachine = machines[machineId] && typeof machines[machineId] === 'object' ? machines[machineId] : {};
   machines[machineId] = {
+    ...prevMachine,
     activatedAt: nowIso(),
     lastSeenAt: nowIso(),
+    resetAt: null,
     tokenHash,
-    allowedProfiles: [],
+    allowedProfiles: Array.isArray(prevMachine.allowedProfiles) ? prevMachine.allowedProfiles : [],
+    workerLimit: normalizeMachineWorkerLimit(prevMachine.workerLimit, 7),
+    note: normalizeMachineNote(prevMachine.note),
   };
   store.machines = machines;
 
@@ -2922,6 +3017,56 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
   return res.json({ ok: true, profile, proxy: null, source: 'none', updatedAt: store.updatedAt || null });
 });
 
+app.post('/v1/client/assets/register', authClient, async (req, res) => {
+  try {
+    const result = await taskSystem.registerClientAsset({
+      machineId: req.clientMachine.machineId,
+      body: req.body || {},
+    });
+    return res.json(result);
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.post('/v1/client/task-batches', authClient, async (req, res) => {
+  try {
+    const batch = await taskSystem.createClientTaskBatch({
+      machineId: req.clientMachine.machineId,
+      body: req.body || {},
+    });
+    return res.json({ ok: true, batch });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.get('/v1/client/task-batches/:id', authClient, async (req, res) => {
+  try {
+    const batch = await taskSystem.getClientTaskBatch({
+      machineId: req.clientMachine.machineId,
+      batchId: String(req.params.id || '').trim(),
+    });
+    if (!batch) return res.status(404).json({ ok: false, error: 'batch not found' });
+    return res.json({ ok: true, batch });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.get('/v1/client/tasks/:id', authClient, async (req, res) => {
+  try {
+    const task = await taskSystem.getClientTask({
+      machineId: req.clientMachine.machineId,
+      taskId: String(req.params.id || '').trim(),
+    });
+    if (!task) return res.status(404).json({ ok: false, error: 'task not found' });
+    return res.json({ ok: true, task });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
 // --- Admin APIs ---
 
 // --- Admin: capture profile storageState via interactive browser ---
@@ -3079,31 +3224,87 @@ app.get('/v1/admin/machines', requireAdmin, (_req, res) => {
       activatedAt: machines[machineId]?.activatedAt || null,
       lastSeenAt: machines[machineId]?.lastSeenAt || null,
       resetAt: machines[machineId]?.resetAt || null,
+      workerLimit: normalizeMachineWorkerLimit(machines[machineId]?.workerLimit, 7),
       allowedProfiles: machines[machineId]?.allowedProfiles || [],
+      note: normalizeMachineNote(machines[machineId]?.note),
     }));
   res.json({ ok: true, machines: list, accounts: listAccountProfiles() });
+});
+
+app.post('/v1/admin/machines/batch-assign', requireAdmin, (req, res) => {
+  const machineIds = Array.isArray(req.body?.machineIds)
+    ? Array.from(new Set(req.body.machineIds.map((s) => String(s).trim()).filter(Boolean)))
+    : [];
+  if (!machineIds.length) return res.status(400).json({ ok: false, error: 'machineIds required' });
+
+  const { hasAllowedProfiles, allowedProfiles } = normalizeAllowedProfilesInput(req.body);
+  if (!hasAllowedProfiles) {
+    return res.status(400).json({ ok: false, error: 'allowedProfiles required' });
+  }
+
+  const store = readStore();
+  const machines = store.machines && typeof store.machines === 'object' ? store.machines : {};
+  const missingMachineIds = machineIds.filter((machineId) => !machines[machineId]);
+  if (missingMachineIds.length) {
+    return res.status(404).json({
+      ok: false,
+      error: `machine not found: ${missingMachineIds.join(', ')}`,
+      missingMachineIds,
+    });
+  }
+
+  for (const machineId of machineIds) {
+    machines[machineId].allowedProfiles = allowedProfiles;
+  }
+  store.machines = machines;
+  const written = writeStore(store);
+  res.json({
+    ok: true,
+    machineIds,
+    updatedCount: machineIds.length,
+    allowedProfiles,
+    storeUpdatedAt: written.updatedAt,
+  });
 });
 
 app.put('/v1/admin/machines/:machineId', requireAdmin, (req, res) => {
   const machineId = String(req.params.machineId || '').trim();
   if (!machineId) return res.status(400).json({ ok: false, error: 'machineId required' });
-  const allowedProfiles = Array.isArray(req.body?.allowedProfiles)
-    ? req.body.allowedProfiles.map((s) => String(s).trim()).filter(Boolean)
-    : typeof req.body?.allowedProfilesText === 'string'
-      ? req.body.allowedProfilesText
-          .split(/\r?\n/g)
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : [];
+  const { hasAllowedProfiles, allowedProfiles } = normalizeAllowedProfilesInput(req.body);
+  const hasWorkerLimit = req.body?.workerLimit != null && String(req.body.workerLimit).trim() !== '';
+  const hasNote = typeof req.body?.note === 'string';
+  if (!hasAllowedProfiles && !hasWorkerLimit && !hasNote) {
+    return res.status(400).json({ ok: false, error: 'no machine fields to update' });
+  }
+
+  const note = hasNote ? normalizeMachineNote(req.body.note) : null;
 
   const store = readStore();
   const machines = store.machines && typeof store.machines === 'object' ? store.machines : {};
   if (!machines[machineId]) return res.status(404).json({ ok: false, error: 'machine not found' });
 
-  machines[machineId].allowedProfiles = allowedProfiles;
+  if (hasAllowedProfiles) {
+    machines[machineId].allowedProfiles = allowedProfiles;
+  }
+  if (hasWorkerLimit) {
+    machines[machineId].workerLimit = normalizeMachineWorkerLimit(
+      req.body.workerLimit,
+      normalizeMachineWorkerLimit(machines[machineId].workerLimit, 7),
+    );
+  }
+  if (hasNote) {
+    machines[machineId].note = note;
+  }
   store.machines = machines;
   const written = writeStore(store);
-  res.json({ ok: true, machineId, allowedProfiles, storeUpdatedAt: written.updatedAt });
+  res.json({
+    ok: true,
+    machineId,
+    allowedProfiles: Array.isArray(machines[machineId].allowedProfiles) ? machines[machineId].allowedProfiles : [],
+    workerLimit: normalizeMachineWorkerLimit(machines[machineId].workerLimit, 7),
+    note: normalizeMachineNote(machines[machineId].note),
+    storeUpdatedAt: written.updatedAt,
+  });
 });
 
 app.post('/v1/admin/machines/:machineId/reset', requireAdmin, (req, res) => {
@@ -3122,8 +3323,74 @@ app.post('/v1/admin/machines/:machineId/reset', requireAdmin, (req, res) => {
   res.json({ ok: true, machineId, resetAt: machines[machineId].resetAt, storeUpdatedAt: written.updatedAt });
 });
 
+app.delete('/v1/admin/machines/:machineId', requireAdmin, (req, res) => {
+  const machineId = String(req.params.machineId || '').trim();
+  if (!machineId) return res.status(400).json({ ok: false, error: 'machineId required' });
+
+  const store = readStore();
+  const machines = store.machines && typeof store.machines === 'object' ? store.machines : {};
+  if (!machines[machineId]) return res.status(404).json({ ok: false, error: 'machine not found' });
+
+  delete machines[machineId];
+  store.machines = machines;
+  const written = writeStore(store);
+  res.json({ ok: true, machineId, storeUpdatedAt: written.updatedAt });
+});
+
 app.get('/v1/admin/accounts', requireAdmin, (_req, res) => {
   res.json({ ok: true, accountsDir: ACCOUNTS_DIR, profiles: listAccountProfiles() });
+});
+
+app.get('/v1/admin/tasks', requireAdmin, async (req, res) => {
+  try {
+    const tasks = await taskSystem.listAdminTasks({
+      limit: req.query.limit,
+      status: req.query.status,
+      machineId: req.query.machineId,
+      batchId: req.query.batchId,
+      taskType: req.query.taskType,
+    });
+    return res.json({ ok: true, tasks });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.get('/v1/admin/task-batches', requireAdmin, async (req, res) => {
+  try {
+    const batches = await taskSystem.listAdminBatches({
+      limit: req.query.limit,
+      machineId: req.query.machineId,
+      status: req.query.status,
+    });
+    return res.json({ ok: true, batches });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.post('/v1/admin/tasks/:id/cancel', requireAdmin, async (req, res) => {
+  try {
+    const task = await taskSystem.cancelTaskByAdmin({
+      taskId: String(req.params.id || '').trim(),
+      actorId: 'admin',
+    });
+    return res.json({ ok: true, task });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.post('/v1/admin/tasks/:id/retry', requireAdmin, async (req, res) => {
+  try {
+    const task = await taskSystem.retryTaskByAdmin({
+      taskId: String(req.params.id || '').trim(),
+      actorId: 'admin',
+    });
+    return res.json({ ok: true, task });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
 });
 
 app.put('/v1/admin/accounts/:profile', requireAdmin, (req, res) => {
@@ -3155,6 +3422,10 @@ app.delete('/v1/admin/accounts/:profile', requireAdmin, (req, res) => {
   try {
     const fp = accountFilePath(profile);
     if (fs.existsSync(fp)) fs.unlinkSync(fp);
+    taskSystem.deleteMirroredAccount(profile).catch((err) => {
+      const msg = err && err.message ? String(err.message) : String(err);
+      console.warn(`⚠️ MySQL mirrored account delete failed for ${profile}: ${msg}`);
+    });
     return res.json({ ok: true, profile });
   } catch {
     return res.status(500).json({ ok: false, error: 'delete failed' });
@@ -3378,6 +3649,109 @@ app.delete('/v1/proxy/:profile', (req, res) => {
   res.json({ ok: true, profile, storeUpdatedAt: written.updatedAt });
 });
 
+app.get('/v1/proxy-policy/:profile/explain', (req, res) => {
+  let profile;
+  try {
+    profile = sanitizeName(req.params.profile);
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message || 'bad profile' });
+  }
+
+  const store = readStore();
+  const entry = store.profiles?.[profile] || null;
+  const staticProxy = normalizeProxy(entry?.proxy ?? entry);
+  const hasStaticProxy = !!staticProxy;
+
+  const policy = getProfilePoolPolicy(entry);
+  const pool = listPoolItems(store);
+  const byId = new Map(pool.map((x) => [x.id, x]));
+
+  const items = policy ? policy.items : [];
+  const stickyPoolItemId = policy?.stickyPoolItemId || null;
+  const availability = policy ? policyAvailability(policy, byId) : { missing: 0, disabled: 0, unusable: 0 };
+
+  const detailed = items.map((x) => {
+    const poolItemId = String(x?.poolItemId || '').trim();
+    const priority = Number.isFinite(x?.priority) ? x.priority : 0;
+    const it = poolItemId ? byId.get(poolItemId) || null : null;
+    const kind = poolItemKind(it);
+    const enabled = it ? it.enabled !== false : false;
+    const nodeLinkOk = kind === 'node' ? !!poolItemNodeLink(it?.node) : true;
+
+    const label =
+      typeof it?.label === 'string' && it.label.trim()
+        ? it.label.trim()
+        : kind === 'node'
+          ? String(it?.node?.remark || it?.node?.title || 'node')
+          : kind === 'proxy'
+            ? String(it?.proxy?.server || 'proxy')
+            : '';
+
+    const reasons = [];
+    if (!poolItemId) reasons.push('invalid_id');
+    if (!it) reasons.push('missing');
+    else if (it.enabled === false) reasons.push('disabled');
+    if (kind === 'node' && !nodeLinkOk) reasons.push('node_missing_fullLink');
+    if (it && kind !== 'node' && kind !== 'proxy') reasons.push('unknown_kind');
+
+    const usable = !!it && enabled && nodeLinkOk && (kind === 'node' || kind === 'proxy');
+    return {
+      poolItemId,
+      priority,
+      exists: !!it,
+      enabled,
+      kind: kind || null,
+      label,
+      usable,
+      reasons,
+      lastCheckAt: it?.lastCheckAt || null,
+      lastCheckOk: typeof it?.lastCheckOk === 'boolean' ? it.lastCheckOk : it?.lastCheckOk == null ? null : null,
+    };
+  });
+
+  const usableItems = detailed.filter((x) => x.usable);
+  const priorities = usableItems.map((x) => x.priority).filter((n) => Number.isFinite(n));
+  const bestPriority = priorities.length ? Math.min(...priorities) : null;
+  const bucket = bestPriority == null ? [] : usableItems.filter((x) => x.priority === bestPriority);
+  const stickyOk = !!stickyPoolItemId && bucket.some((x) => x.poolItemId === stickyPoolItemId);
+  const wouldPickPoolItemId = stickyOk ? stickyPoolItemId : bucket.length ? bucket[0].poolItemId : null;
+
+  const globalEnabled = pool.filter((x) => x && x.enabled !== false).length;
+  const globalTotal = pool.length;
+
+  return res.json({
+    ok: true,
+    profile,
+    hasStaticProxy,
+    staticProxy: staticProxy || null,
+    storeUpdatedAt: store.updatedAt || null,
+    policy: policy
+      ? {
+          items: policy.items,
+          stickyPoolItemId: policy.stickyPoolItemId || null,
+          stickyAt: policy.stickyAt || null,
+          updatedAt: policy.updatedAt || null,
+        }
+      : null,
+    explain: {
+      note: hasStaticProxy ? '当前设置了静态代理：客户端会优先使用静态代理，忽略代理池策略。' : '',
+      policyItems: items.length,
+      policyUsable: usableItems.length,
+      policyMissing: availability.missing,
+      policyDisabled: availability.disabled,
+      policyUnusable: availability.unusable,
+      bestPriority,
+      bucket: bucket.map((x) => x.poolItemId),
+      stickyPoolItemId: stickyPoolItemId || null,
+      stickyOk,
+      wouldPickPoolItemId,
+      globalPoolEnabled: globalEnabled,
+      globalPoolTotal: globalTotal,
+    },
+    items: detailed,
+  });
+});
+
 app.get('/v1/proxy-policy/:profile', (req, res) => {
   let profile;
   try {
@@ -3495,57 +3869,59 @@ app.delete('/v1/proxy-policy/:profile', (req, res) => {
 
 function startServer({ port = PORT, host = HOST } = {}) {
   ensureStore();
-  return new Promise((resolve, reject) => {
-    const server = app.listen(port, host);
-    server.once('error', reject);
-    server.once('listening', () => {
-      const addr = server.address();
-      const actualPort = addr && typeof addr === 'object' ? addr.port : port;
-      // If binding to 0.0.0.0, prefer a loopback URL for local UI / logs.
-      const baseHost = host === '0.0.0.0' ? '127.0.0.1' : host;
-      const baseUrl = `http://${baseHost}:${actualPort}`;
-      const lanUrls = [];
-      if (host === '0.0.0.0') {
-        try {
-          const nets = os.networkInterfaces();
-          for (const name of Object.keys(nets || {})) {
-            for (const net of nets[name] || []) {
-              if (!net || net.internal) continue;
-              if (net.family !== 'IPv4') continue;
-              lanUrls.push(`http://${net.address}:${actualPort}`);
+  return ensureTaskSystemBootstrap().then(() => {
+    return new Promise((resolve, reject) => {
+      const server = app.listen(port, host);
+      server.once('error', reject);
+      server.once('listening', () => {
+        const addr = server.address();
+        const actualPort = addr && typeof addr === 'object' ? addr.port : port;
+        // If binding to 0.0.0.0, prefer a loopback URL for local UI / logs.
+        const baseHost = host === '0.0.0.0' ? '127.0.0.1' : host;
+        const baseUrl = `http://${baseHost}:${actualPort}`;
+        const lanUrls = [];
+        if (host === '0.0.0.0') {
+          try {
+            const nets = os.networkInterfaces();
+            for (const name of Object.keys(nets || {})) {
+              for (const net of nets[name] || []) {
+                if (!net || net.internal) continue;
+                if (net.family !== 'IPv4') continue;
+                lanUrls.push(`http://${net.address}:${actualPort}`);
+              }
             }
+          } catch {
+            // ignore
           }
-        } catch {
-          // ignore
         }
-      }
-      RUNTIME.host = host;
-      RUNTIME.port = port;
-      RUNTIME.actualPort = actualPort;
-      RUNTIME.baseUrl = baseUrl;
-      RUNTIME.lanUrls = lanUrls;
-      RUNTIME.startedAt = nowIso();
-      console.log('🧩 Proxy Service started');
-      console.log(`📍 本机访问：${baseUrl}`);
-      if (lanUrls.length) {
-        console.log(`🌐 局域网访问：${lanUrls.join(' , ')}`);
-      }
-      console.log(`🗂️ store: ${STORE_PATH}`);
-      console.log('🔐 admin: open /login.html to sign in');
-      if (process.env.PROXY_UPSTREAM_URL) {
-        console.log(`🌐 upstream: ${process.env.PROXY_UPSTREAM_URL}`);
-      } else {
-        console.log('ℹ️ upstream: (disabled) set PROXY_UPSTREAM_URL to enable');
-      }
+        RUNTIME.host = host;
+        RUNTIME.port = port;
+        RUNTIME.actualPort = actualPort;
+        RUNTIME.baseUrl = baseUrl;
+        RUNTIME.lanUrls = lanUrls;
+        RUNTIME.startedAt = nowIso();
+        console.log('🧩 Proxy Service started');
+        console.log(`📍 本机访问：${baseUrl}`);
+        if (lanUrls.length) {
+          console.log(`🌐 局域网访问：${lanUrls.join(' , ')}`);
+        }
+        console.log(`🗂️ store: ${STORE_PATH}`);
+        console.log('🔐 admin: open /login.html to sign in');
+        if (process.env.PROXY_UPSTREAM_URL) {
+          console.log(`🌐 upstream: ${process.env.PROXY_UPSTREAM_URL}`);
+        } else {
+          console.log('ℹ️ upstream: (disabled) set PROXY_UPSTREAM_URL to enable');
+        }
 
-      if (isPoolAutoCheckEnabled()) {
-        startPoolNodeAutoToggleLoop(server);
-        const cfg = getPoolNodeAutoToggleDefaults();
-        console.log(`🧪 pool auto-check: enabled (nodes every ${Math.round(cfg.intervalMs / 1000)}s ×${cfg.tries})`);
-      } else {
-        console.log('🧪 pool auto-check: disabled (set PROXY_POOL_AUTOCHECK=1 to enable)');
-      }
-      resolve({ app, server, host, port: actualPort, baseUrl, lanUrls });
+        if (isPoolAutoCheckEnabled()) {
+          startPoolNodeAutoToggleLoop(server);
+          const cfg = getPoolNodeAutoToggleDefaults();
+          console.log(`🧪 pool auto-check: enabled (nodes every ${Math.round(cfg.intervalMs / 1000)}s ×${cfg.tries})`);
+        } else {
+          console.log('🧪 pool auto-check: disabled (set PROXY_POOL_AUTOCHECK=1 to enable)');
+        }
+        resolve({ app, server, host, port: actualPort, baseUrl, lanUrls });
+      });
     });
   });
 }

@@ -105,10 +105,6 @@
           </div>
           <div class="card-b">
             <div class="toolbar">
-              <div class="sub">
-                勾选启用开关即刻生效；标签会自动保存。点击“复制”：代理条目复制地址（不含密码），节点条目复制分享链接（包含 uuid/密码）。
-                <span class="mono">自动检测</span>：仅代理池内的<span class="mono">节点</span>会后台每 3 分钟 ×3 次检测，稳定后自动启用/禁用。
-              </div>
               <div class="row" style="justify-content: space-between; flex-wrap: wrap">
                 <div class="row">
                   <input
@@ -119,11 +115,15 @@
                     autocomplete="off"
                   />
                   <select id="checkMethod" style="width: 90px">
-                    <option value="HEAD">HEAD</option>
                     <option value="GET">GET</option>
+                    <option value="HEAD">HEAD</option>
                   </select>
                 </div>
                 <div class="row">
+                  <span class="chip" title="当前勾选数量"><span class="mono">已选</span> <strong id="selCount">0</strong></span>
+                  <button class="btn" id="btnBulkEnable" title="启用勾选条目">启用</button>
+                  <button class="btn" id="btnBulkDisable" title="禁用勾选条目">禁用</button>
+                  <button class="btn danger" id="btnBulkDelete" title="删除勾选条目">删除</button>
                   <button class="btn" id="btnCheckAll" title="按当前筛选逐个检测">一键检测</button>
                   <button class="btn danger" id="btnPurgeDisabled" title="删除所有禁用项">清理禁用</button>
                 </div>
@@ -135,6 +135,11 @@
               <table>
                 <thead>
                   <tr>
+                    <th style="width: 56px">
+                      <label class="check" title="全选/取消全选（当前页）">
+                        <input type="checkbox" id="chkAllPage" />
+                      </label>
+                    </th>
                     <th style="width: 74px">启用</th>
                     <th>条目</th>
                     <th style="width: 220px">标签</th>
@@ -294,6 +299,75 @@
       let checkInited = false;
       let queryInited = false;
       let focusId = "";
+      const selectedIds = new Set();
+
+      function setSelCount() {
+        const el = $("selCount");
+        if (el) el.textContent = String(selectedIds.size || 0);
+      }
+
+      function getSelectedList() {
+        return Array.from(selectedIds.values())
+          .map((s) => String(s || "").trim())
+          .filter(Boolean);
+      }
+
+      async function bulkSetEnabled(enabled) {
+        const ids = getSelectedList();
+        if (!ids.length) {
+          setStatus("warn", "请先勾选要操作的条目。", { autoHideMs: 2500 });
+          return;
+        }
+        setStatus("warn", `正在批量${enabled ? "启用" : "禁用"} ${ids.length} 条…`, { autoHideMs: 0 });
+        let ok = 0;
+        let fail = 0;
+        for (const id of ids) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await j(`/v1/pool/${encodeURIComponent(id)}`, {
+              method: "PUT",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ enabled: !!enabled }),
+            });
+            ok += 1;
+          } catch {
+            fail += 1;
+          }
+        }
+        selectedIds.clear();
+        setSelCount();
+        await refresh();
+        setStatus(fail ? "warn" : "good", `批量${enabled ? "启用" : "禁用"}完成：成功 ${ok}，失败 ${fail}`, {
+          autoHideMs: fail ? 9000 : 4500,
+        });
+      }
+
+      async function bulkDelete() {
+        const ids = getSelectedList();
+        if (!ids.length) {
+          setStatus("warn", "请先勾选要删除的条目。", { autoHideMs: 2500 });
+          return;
+        }
+        if (!confirm(`确认删除勾选的 ${ids.length} 条吗？（会同步清理账号策略引用）`)) return;
+        setStatus("warn", `正在批量删除 ${ids.length} 条…`, { autoHideMs: 0 });
+        let ok = 0;
+        let fail = 0;
+        for (const id of ids) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await delItem(id);
+            ok += 1;
+          } catch {
+            fail += 1;
+          }
+        }
+        selectedIds.clear();
+        setSelCount();
+        await refresh();
+        setStatus(fail ? "warn" : "good", `批量删除完成：成功 ${ok}，失败 ${fail}`, {
+          autoHideMs: fail ? 9000 : 4500,
+        });
+      }
 
       function getQueryParams() {
         try {
@@ -321,17 +395,42 @@
         focusId = focus || q || "";
       }
 
-      function clampTableScroll() {
-        const box = document.querySelector(".tablebox");
+      function getTableBox() {
+        const tbody = $("tbody");
+        if (tbody && typeof tbody.closest === "function") {
+          const box = tbody.closest(".tablebox");
+          if (box) return box;
+        }
+        return document.querySelector(".tablebox");
+      }
+
+      function getTableScrollState() {
+        const box = getTableBox();
+        if (!box) return { top: 0, left: 0 };
+        return {
+          top: Number(box.scrollTop || 0),
+          left: Number(box.scrollLeft || 0),
+        };
+      }
+
+      function clampTableScroll(state = null) {
+        const box = getTableBox();
         if (!box) return;
-        requestAnimationFrame(() => {
+        const apply = () => {
           try {
-            const max = Math.max(0, box.scrollHeight - box.clientHeight);
-            if (box.scrollTop > max) box.scrollTop = max;
-            if (box.scrollTop < 0) box.scrollTop = 0;
+            const maxTop = Math.max(0, box.scrollHeight - box.clientHeight);
+            const maxLeft = Math.max(0, box.scrollWidth - box.clientWidth);
+            const nextTop = state && Number.isFinite(Number(state.top)) ? Number(state.top) : Number(box.scrollTop || 0);
+            const nextLeft = state && Number.isFinite(Number(state.left)) ? Number(state.left) : Number(box.scrollLeft || 0);
+            box.scrollTop = Math.min(Math.max(0, nextTop), maxTop);
+            box.scrollLeft = Math.min(Math.max(0, nextLeft), maxLeft);
           } catch {
             // ignore
           }
+        };
+        apply();
+        requestAnimationFrame(() => {
+          apply();
         });
       }
 
@@ -367,22 +466,24 @@
       function render() {
         const tbody = $("tbody");
         const filtered = getFilteredItems();
+        const tableScrollState = getTableScrollState();
 
         const pageItems = pager ? pager.slice(filtered) : filtered;
 
         tbody.innerHTML = "";
         if (!filtered.length) {
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td colspan="4" style="padding:14px">
+          tr.innerHTML = `<td colspan="5" style="padding:14px">
             <div class="sub">没有匹配项。</div>
             <div class="meta">可以试试清空搜索，或在左侧添加代理（节点请在“节点”页加入）。</div>
           </td>`;
           tbody.appendChild(tr);
-          clampTableScroll();
+          clampTableScroll(tableScrollState);
           return;
         }
 
         for (const it of pageItems) {
+          const isSel = selectedIds.has(String(it.id || ""));
           const kind = itemKind(it);
           const checkAt = ts(it.lastCheckAt);
           const checkOk = !it.lastCheckAt
@@ -408,6 +509,11 @@
             const checkType = it.lastCheckType ? String(it.lastCheckType).toUpperCase() : "—";
             const checkDetail = it.lastCheckDetail || it.lastCheckError || "—";
             tr.innerHTML = `
+              <td>
+                <label class="check" title="勾选用于批量操作">
+                  <input type="checkbox" data-sel="${esc(it.id)}" ${isSel ? "checked" : ""} />
+                </label>
+              </td>
               <td>
                 <div class="switch">
                   <input class="hidden" type="checkbox" id="en_${esc(
@@ -467,6 +573,11 @@
                   : "—";
             tr.innerHTML = `
               <td>
+                <label class="check" title="勾选用于批量操作">
+                  <input type="checkbox" data-sel="${esc(it.id)}" ${isSel ? "checked" : ""} />
+                </label>
+              </td>
+              <td>
                 <div class="switch">
                   <input class="hidden" type="checkbox" id="en_${esc(
                     it.id,
@@ -507,8 +618,15 @@
           }
           tbody.appendChild(tr);
         }
-        clampTableScroll();
+        clampTableScroll(tableScrollState);
         highlightFocusRow();
+        setSelCount();
+        const chk = $("chkAllPage");
+        if (chk) {
+          const ids = pageItems.map((x) => String(x?.id || "")).filter(Boolean);
+          chk.checked = ids.length > 0 && ids.every((id) => selectedIds.has(id));
+          chk.indeterminate = ids.some((id) => selectedIds.has(id)) && !chk.checked;
+        }
       }
 
       function upsertItem(updated) {
@@ -538,15 +656,19 @@
               checkInited = true;
               const poolCheck = store && store.poolCheck ? store.poolCheck : null;
               const defaultUrl = poolCheck && poolCheck.url ? String(poolCheck.url) : "";
-              const defaultMethod = poolCheck && poolCheck.method ? String(poolCheck.method) : "HEAD";
+              const defaultMethod = poolCheck && poolCheck.method ? String(poolCheck.method) : "GET";
               try {
               const savedUrlRaw = localStorage.getItem("pool_check_url") || "";
               const savedMethodRaw = localStorage.getItem("pool_check_method") || "";
+              const savedMethodUser = localStorage.getItem("pool_check_method_user") || "";
               // If user still has the old default (google generate_204) saved, auto-upgrade to the new default.
               const savedUrl =
                 String(savedUrlRaw || "").includes("google.com/generate_204") ? "" : String(savedUrlRaw || "");
+              // Auto-upgrade old default method (HEAD) to GET, unless user explicitly changed it.
+              const upgradedMethod =
+                !savedMethodUser && String(savedMethodRaw || "").trim().toUpperCase() === "HEAD" ? "" : String(savedMethodRaw || "");
               const savedMethod =
-                String(savedUrlRaw || "").includes("google.com/generate_204") ? "" : String(savedMethodRaw || "");
+                String(savedUrlRaw || "").includes("google.com/generate_204") ? "" : String(upgradedMethod || "");
               $("checkUrl").value = savedUrl || $("checkUrl").value || defaultUrl;
               $("checkMethod").value = savedMethod || $("checkMethod").value || defaultMethod;
               } catch {
@@ -624,7 +746,7 @@
 
       async function checkProxy(id, { silent = false } = {}) {
         const url = String($("checkUrl").value || "").trim();
-        const method = String($("checkMethod").value || "HEAD").trim().toUpperCase();
+        const method = String($("checkMethod").value || "GET").trim().toUpperCase();
         try {
           try {
             if (url) localStorage.setItem("pool_check_url", url);
@@ -733,7 +855,8 @@
           return;
         }
 
-        const items = getFilteredItems();
+        const selected = getSelectedList();
+        const items = selected.length ? selected.map((id) => ({ id })) : getFilteredItems();
         if (!items.length) {
           setStatus("warn", "没有可检测项（请调整筛选）", { autoHideMs: 2500 });
           return;
@@ -747,11 +870,7 @@
           for (let i = 0; i < items.length; i++) {
             if (bulkCheckCancel) break;
             const it = items[i];
-            const kind = itemKind(it);
-            const label =
-              kind === "node"
-                ? parseNodeBrief(it?.node)?.remark || it?.label || it?.id
-                : it?.proxy?.server || it?.label || it?.id;
+            const label = it?.id || "";
             setStatus("warn", `检测 ${i + 1}/${items.length}：${label}`, { autoHideMs: 0 });
             // sequential keeps load predictable (Playwright proxy checks are heavy)
             // eslint-disable-next-line no-await-in-loop
@@ -790,6 +909,35 @@
       });
       $("btnPurgeDisabled").addEventListener("click", purgeDisabled);
       $("btnCheckAll").addEventListener("click", checkAll);
+      $("btnBulkEnable").addEventListener("click", () => bulkSetEnabled(true));
+      $("btnBulkDisable").addEventListener("click", () => bulkSetEnabled(false));
+      $("btnBulkDelete").addEventListener("click", bulkDelete);
+      $("checkMethod").addEventListener("change", () => {
+        try {
+          const method = String($("checkMethod").value || "").trim().toUpperCase();
+          if (method) localStorage.setItem("pool_check_method", method);
+          localStorage.setItem("pool_check_method_user", "1");
+        } catch {
+          // ignore
+        }
+      });
+      $("checkUrl").addEventListener("change", () => {
+        try {
+          const url = String($("checkUrl").value || "").trim();
+          if (url) localStorage.setItem("pool_check_url", url);
+        } catch {
+          // ignore
+        }
+      });
+      $("chkAllPage").addEventListener("change", (e) => {
+        const on = !!e.target.checked;
+        const filtered = getFilteredItems();
+        const pageItems = pager ? pager.slice(filtered) : filtered;
+        const ids = pageItems.map((x) => String(x?.id || "")).filter(Boolean);
+        if (on) ids.forEach((id) => selectedIds.add(id));
+        else ids.forEach((id) => selectedIds.delete(id));
+        render();
+      });
 
       $("btnLogout").addEventListener("click", async () => {
         try {
@@ -826,6 +974,14 @@
       });
 
       document.addEventListener("change", async (e) => {
+        const sel = e.target.closest("input[data-sel]");
+        if (sel) {
+          const id = String(sel.getAttribute("data-sel") || "");
+          if (sel.checked) selectedIds.add(id);
+          else selectedIds.delete(id);
+          setSelCount();
+          return;
+        }
         const en = e.target.closest("input[data-enable]");
         if (!en) return;
         const id = en.getAttribute("data-enable");

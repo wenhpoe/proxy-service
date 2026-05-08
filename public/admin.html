@@ -41,11 +41,15 @@
           <div class="card-b">
             <div class="toolbar">
               <div class="sub">
-                机器列表只显示已激活的机器（已发放令牌）。点击机器码或“分配账号”可打开弹窗，用勾选方式分配账号。
+                机器列表只显示已激活的机器（已发放令牌）。你可以直接填写备注区分设备归属；点击机器码或“分配账号”可打开弹窗，用勾选方式分配账号。
                 <span class="mono">lastSeenAt</span> 会在客户端请求接口时更新。
               </div>
               <div class="row" style="justify-content: flex-end">
-                <input class="input" id="machSearch" placeholder="搜索机器码…" style="width: 220px" />
+                <span class="chip"><span class="mono">已选设备</span> <strong id="machSelCount">0</strong></span>
+                <button class="btn" id="btnMachToggleFilteredSel" disabled>选中筛选结果</button>
+                <button class="btn" id="btnMachClearSel" disabled>清空选择</button>
+                <button class="btn primary" id="btnBatchAssign" disabled>批量分配账号</button>
+                <input class="input" id="machSearch" placeholder="搜索机器码或备注…" style="width: 220px" />
                 <select id="machPageSize" style="width: 110px"></select>
                 <button class="btn" id="machPrev">上一页</button>
                 <button class="btn" id="machNext">下一页</button>
@@ -60,11 +64,15 @@
               <table>
                 <thead>
                   <tr>
+                    <th style="width: 56px; text-align: center">
+                      <input class="check" type="checkbox" id="machSelectPage" title="勾选/取消本页设备" />
+                    </th>
                     <th>机器码</th>
+                    <th style="width: 300px">备注</th>
                     <th style="width: 180px">激活时间</th>
                     <th style="width: 180px">最后同步</th>
                     <th style="width: 110px">账号数</th>
-                    <th style="width: 240px">操作</th>
+                    <th style="width: 320px">操作</th>
                   </tr>
                 </thead>
                 <tbody id="machinesTbody"></tbody>
@@ -91,26 +99,27 @@
           </div>
         </div>
         <div class="modal-b">
-          <div class="split">
-            <div>
-              <label class="sub">搜索账号</label>
-              <div style="height: 6px"></div>
-              <input class="input" id="accSearch" placeholder="输入账号关键字…" />
-              <div style="height: 10px"></div>
-              <div class="row">
-                <button class="btn" id="btnSelAll">全选</button>
-                <button class="btn" id="btnSelNone">清空</button>
-                <button class="btn" id="btnSelOnly" aria-pressed="false">仅已选</button>
+          <div class="modal-grid">
+            <section class="modal-pane" aria-label="账号选择">
+              <div class="modal-toolbar">
+                <input class="input" id="accSearch" placeholder="搜索账号（关键字）…" style="min-width: 240px; flex: 1" />
+                <button class="btn" id="btnSelOnly" aria-pressed="false" title="只看已选账号">仅已选</button>
               </div>
               <div style="height: 10px"></div>
-              <div class="pager" style="justify-content: flex-start">
-                <select id="accPageSize" style="width: 110px"></select>
-                <button class="btn" id="accPrev">上一页</button>
-                <button class="btn" id="accNext">下一页</button>
-                <span class="chip"><span class="mono" id="accInfo">—</span></span>
+              <div class="modal-toolbar">
+                <div class="row" style="gap: 8px">
+                  <button class="btn" id="btnSelAll">全选</button>
+                  <button class="btn" id="btnSelNone">清空</button>
+                </div>
+                <div class="pager" style="justify-content: flex-start">
+                  <select id="accPageSize" style="width: 110px"></select>
+                  <button class="btn" id="accPrev">上一页</button>
+                  <button class="btn" id="accNext">下一页</button>
+                  <span class="chip"><span class="mono" id="accInfo">—</span></span>
+                </div>
               </div>
               <div style="height: 10px"></div>
-              <div class="tablebox" style="max-height: 48vh">
+              <div class="tablebox" style="max-height: 52vh">
                 <table>
                   <thead>
                     <tr>
@@ -121,26 +130,42 @@
                   <tbody id="accCheckTbody"></tbody>
                 </table>
               </div>
-            </div>
-            <div>
-              <div class="hint">
-                勾选后点击“保存分配”。保存会覆盖该机器之前的分配列表（客户端下次同步生效）。
+            </section>
+
+            <aside class="modal-pane modal-side" aria-label="分配信息">
+              <div class="hint" id="assignHint">
+                保存会覆盖该机器之前的分配列表（客户端下次同步生效）。
               </div>
               <div style="height: 10px"></div>
               <div class="row">
+                <span class="chip"><span class="mono">设备</span> <strong id="assignTargetCount">0</strong></span>
                 <span class="chip"><span class="mono">已选</span> <strong id="selCount">0</strong></span>
                 <span class="chip"><span class="mono">总数</span> <strong id="accTotal">0</strong></span>
               </div>
+
+              <div style="height: 10px"></div>
+              <div class="sub">目标设备</div>
+              <div style="height: 6px"></div>
+              <div class="chips" id="assignMachinePreview"></div>
+
+              <div style="height: 10px"></div>
+              <div class="sub">已选预览</div>
+              <div style="height: 6px"></div>
+              <div class="chips" id="selPreview"></div>
+
+              <div style="height: 10px"></div>
               <div class="status" id="statusModal" hidden></div>
+
               <div style="height: 12px"></div>
               <div class="modal-actions">
                 <button class="btn primary" id="btnSaveAssign">保存分配</button>
                 <button class="btn" id="btnCancelAssign">取消</button>
               </div>
+
               <div class="meta">
-                小提示：账号列表来自服务端 <span class="mono">accounts/</span> 目录。先上传/更新账号 JSON，再来分配会更顺手。
+                账号列表来自 <span class="mono">accounts/</span>。先上传/更新账号 JSON，再来分配会更顺手。
               </div>
-            </div>
+            </aside>
           </div>
         </div>
       </div>
@@ -151,11 +176,13 @@
       const state = {
         machines: [],
         accounts: [],
-        assignMachineId: null,
+        assignMachineIds: [],
         selected: new Set(),
+        selectedMachineIds: new Set(),
         onlySelected: false,
       };
       const resetArmed = new Set();
+      const deleteArmed = new Set();
 
       let pagerMachines = null;
       let pagerModalAccounts = null;
@@ -213,37 +240,102 @@
         }
       }
 
-      function renderMachines() {
+      function getFilteredMachines() {
         const q = String($("machSearch").value || "").trim().toLowerCase();
+        const machines = Array.isArray(state.machines) ? state.machines : [];
+        return q
+          ? machines.filter((m) => {
+              const machineId = String(m.machineId || "").toLowerCase();
+              const note = String(m.note || "").toLowerCase();
+              return machineId.includes(q) || note.includes(q);
+            })
+          : machines;
+      }
+
+      function updateMachineSelectionUi(pageItems) {
+        const ids = Array.from(state.selectedMachineIds.values());
+        const count = ids.length;
+        $("machSelCount").textContent = String(count);
+        const filteredMachineIds = getFilteredMachines()
+          .map((m) => String(m.machineId || "").trim())
+          .filter(Boolean);
+        const selectedFilteredCount = filteredMachineIds.filter((id) => state.selectedMachineIds.has(id)).length;
+        const btnToggleFiltered = $("btnMachToggleFilteredSel");
+        btnToggleFiltered.disabled = filteredMachineIds.length === 0;
+        btnToggleFiltered.textContent =
+          filteredMachineIds.length > 0 && selectedFilteredCount === filteredMachineIds.length
+            ? `取消筛选结果 (${filteredMachineIds.length})`
+            : `选中筛选结果 (${filteredMachineIds.length})`;
+        $("btnMachClearSel").disabled = count === 0;
+        $("btnBatchAssign").disabled = count === 0;
+
+        const pageCheckbox = $("machSelectPage");
+        const pageMachineIds = (Array.isArray(pageItems) ? pageItems : []).map((m) => String(m.machineId || "")).filter(Boolean);
+        const selectedOnPage = pageMachineIds.filter((id) => state.selectedMachineIds.has(id)).length;
+        pageCheckbox.disabled = pageMachineIds.length === 0;
+        pageCheckbox.checked = !!pageMachineIds.length && selectedOnPage === pageMachineIds.length;
+        pageCheckbox.indeterminate = selectedOnPage > 0 && selectedOnPage < pageMachineIds.length;
+      }
+
+      function getOrderedSelectedMachineIds() {
+        const selected = state.selectedMachineIds;
+        return state.machines
+          .map((m) => String(m.machineId || "").trim())
+          .filter((id) => id && selected.has(id));
+      }
+
+      function renderMachines() {
         const tbody = $("machinesTbody");
         tbody.innerHTML = "";
 
-        const machines = Array.isArray(state.machines) ? state.machines : [];
-        const filtered = q ? machines.filter((m) => String(m.machineId || "").toLowerCase().includes(q)) : machines;
+        const filtered = getFilteredMachines();
         const pageItems = pagerMachines ? pagerMachines.slice(filtered) : filtered;
+        updateMachineSelectionUi(pageItems);
 
         if (!filtered.length) {
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td colspan="5" class="sub" style="padding:12px">暂无机器（或搜索无结果）。客户端激活后会出现在这里。</td>`;
+          tr.innerHTML = `<td colspan="7" class="sub" style="padding:12px">暂无机器（或搜索无结果）。客户端激活后会出现在这里。</td>`;
           tbody.appendChild(tr);
           return;
         }
 
         for (const m of pageItems) {
           const allowed = Array.isArray(m.allowedProfiles) ? m.allowedProfiles : [];
+          const note = String(m.note || "");
+          const machineId = String(m.machineId || "");
           const tr = document.createElement("tr");
           tr.innerHTML = `
+            <td style="text-align:center">
+              <input class="check" type="checkbox" data-machine-select="${esc(machineId)}" ${
+                state.selectedMachineIds.has(machineId) ? "checked" : ""
+              } />
+            </td>
             <td class="mono">
-              <a href="#" data-assign="${esc(m.machineId)}" title="分配账号">${esc(m.machineId)}</a>
+              <a href="#" data-assign="${esc(machineId)}" title="分配账号">${esc(machineId)}</a>
+            </td>
+            <td>
+              <div class="machine-note-cell">
+                <input
+                  class="input sm machine-note-input"
+                  data-note-input="${esc(machineId)}"
+                  value="${esc(note)}"
+                  placeholder="填写备注，例如：张三 / 办公室 Mac"
+                  maxlength="160"
+                />
+                <button class="btn sm" data-save-note="${esc(machineId)}">保存备注</button>
+              </div>
             </td>
             <td class="mono">${esc(ts(m.activatedAt))}</td>
             <td class="mono">${esc(ts(m.lastSeenAt))}</td>
             <td class="mono">${allowed.length}</td>
             <td>
-              <div class="row">
-                <button class="btn sm primary" data-assign="${esc(m.machineId)}">分配账号</button>
-                <button class="btn sm danger" data-reset="${esc(m.machineId)}">${
-                  resetArmed.has(m.machineId) ? "确认重置" : "重置设备"
+              <div class="row machine-actions">
+                <button class="btn sm primary" data-assign="${esc(machineId)}">分配账号</button>
+                <button class="btn sm danger" data-reset="${esc(machineId)}">${
+                  resetArmed.has(machineId) ? "确认重置" : "重置设备"
+                }</button>
+                <button class="btn sm danger" data-delete="${esc(machineId)}">${
+                  deleteArmed.has(machineId) ? "确认删除" : "删除机器码"
                 }</button>
               </div>
             </td>
@@ -252,16 +344,69 @@
         }
       }
 
-      function openAssignModal(machineId) {
-        const m = state.machines.find((x) => x.machineId === machineId);
-        if (!m) return;
-        state.assignMachineId = machineId;
-        state.selected = new Set((m.allowedProfiles || []).map((x) => String(x).trim()).filter(Boolean));
+      function findMachineNoteInput(machineId) {
+        return Array.from(document.querySelectorAll('input[data-note-input]')).find(
+          (el) => el.getAttribute("data-note-input") === machineId,
+        );
+      }
+
+      function renderAssignMachinePreview() {
+        const host = $("assignMachinePreview");
+        if (!host) return;
+        host.innerHTML = "";
+        const list = state.assignMachineIds.map((x) => String(x || "").trim()).filter(Boolean);
+        if (!list.length) {
+          host.innerHTML = `<span class="badge mono">未选择设备</span>`;
+          return;
+        }
+        const max = 10;
+        const show = list.slice(0, max);
+        for (const machineId of show) {
+          const el = document.createElement("span");
+          el.className = "badge mono";
+          el.textContent = machineId;
+          host.appendChild(el);
+        }
+        if (list.length > max) {
+          const more = document.createElement("span");
+          more.className = "badge mono";
+          more.textContent = `+${list.length - max}`;
+          host.appendChild(more);
+        }
+      }
+
+      function openAssignModal(machineIds) {
+        const ids = (Array.isArray(machineIds) ? machineIds : [machineIds])
+          .map((x) => String(x || "").trim())
+          .filter(Boolean);
+        const targets = ids
+          .map((machineId) => state.machines.find((x) => x.machineId === machineId))
+          .filter(Boolean);
+        if (!targets.length) return;
+
+        state.assignMachineIds = targets.map((m) => String(m.machineId));
+        const allowedLists = targets.map((m) =>
+          Array.isArray(m.allowedProfiles)
+            ? m.allowedProfiles.map((x) => String(x).trim()).filter(Boolean).sort((a, b) => a.localeCompare(b, "zh-CN"))
+            : [],
+        );
+        const firstSerialized = JSON.stringify(allowedLists[0] || []);
+        const sameAssignments = allowedLists.every((list) => JSON.stringify(list) === firstSerialized);
+        state.selected = new Set(sameAssignments ? allowedLists[0] || [] : []);
         state.onlySelected = false;
         pagerModalAccounts?.reset();
         $("btnSelOnly").setAttribute("aria-pressed", "false");
         $("btnSelOnly").textContent = "仅已选";
-        $("assignMachineId").textContent = machineId;
+        $("assignMachineId").textContent =
+          targets.length === 1 ? targets[0].machineId : `${targets.length} 台设备`;
+        $("assignTargetCount").textContent = String(targets.length);
+        $("assignHint").textContent =
+          targets.length === 1
+            ? "保存会覆盖该机器之前的分配列表（客户端下次同步生效）。"
+            : sameAssignments
+              ? "保存会统一覆盖所有选中设备的分配列表（客户端下次同步生效）。"
+              : "当前选中设备的已有分配不一致，未自动预填账号；保存后会统一覆盖所有选中设备。";
+        renderAssignMachinePreview();
         $("accSearch").value = "";
         setStatus("statusModal", "", "");
         renderAccountChecks();
@@ -270,9 +415,40 @@
 
       function closeAssignModal() {
         $("assignModal").hidden = true;
-        state.assignMachineId = null;
+        state.assignMachineIds = [];
         state.selected = new Set();
+        $("assignTargetCount").textContent = "0";
+        $("assignHint").textContent = "保存会覆盖该机器之前的分配列表（客户端下次同步生效）。";
+        renderAssignMachinePreview();
         setStatus("statusModal", "", "");
+      }
+
+      function renderSelectedPreview() {
+        const host = $("selPreview");
+        if (!host) return;
+        host.innerHTML = "";
+        const list = Array.from(state.selected.values())
+          .map((x) => String(x || "").trim())
+          .filter(Boolean)
+          .sort((a, b) => a.localeCompare(b, "zh-CN"));
+        if (!list.length) {
+          host.innerHTML = `<span class="badge mono">未选择</span>`;
+          return;
+        }
+        const max = 18;
+        const show = list.slice(0, max);
+        for (const name of show) {
+          const el = document.createElement("span");
+          el.className = "badge mono good";
+          el.textContent = name;
+          host.appendChild(el);
+        }
+        if (list.length > max) {
+          const more = document.createElement("span");
+          more.className = "badge mono";
+          more.textContent = `+${list.length - max}`;
+          host.appendChild(more);
+        }
       }
 
       function renderAccountChecks() {
@@ -296,6 +472,7 @@
         const pageItems = pagerModalAccounts ? pagerModalAccounts.slice(filtered) : filtered;
 
         $("selCount").textContent = String(state.selected.size);
+        renderSelectedPreview();
 
         if (!filtered.length) {
           const tr = document.createElement("tr");
@@ -344,6 +521,7 @@
             if (e.target.checked) state.selected.add(prof);
             else state.selected.delete(prof);
             $("selCount").textContent = String(state.selected.size);
+            renderSelectedPreview();
             if (state.onlySelected) renderAccountChecks();
           });
         }
@@ -354,10 +532,37 @@
         const r = await j("/v1/admin/machines");
         state.machines = Array.isArray(r.machines) ? r.machines : [];
         state.accounts = Array.isArray(r.accounts) ? r.accounts : [];
+        const validIds = new Set(state.machines.map((m) => String(m.machineId || "").trim()).filter(Boolean));
+        state.selectedMachineIds = new Set(
+          Array.from(state.selectedMachineIds.values()).filter((machineId) => validIds.has(machineId)),
+        );
         resetArmed.clear();
+        deleteArmed.clear();
         pagerMachines?.reset();
         renderMachines();
         return r;
+      }
+
+      async function saveMachineNote(machineId) {
+        const id = String(machineId || "").trim();
+        if (!id) return;
+        const input = findMachineNoteInput(id);
+        if (!input) return;
+        const note = String(input.value || "").trim();
+        try {
+          setStatus("statusMach", "warn", `正在保存备注：${id}…`);
+          const r = await j(`/v1/admin/machines/${encodeURIComponent(id)}`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ note }),
+          });
+          const m = state.machines.find((x) => x.machineId === id);
+          if (m) m.note = String(r.note || "");
+          renderMachines();
+          setStatus("statusMach", "good", `已保存备注：${id}`);
+        } catch (e) {
+          setStatus("statusMach", "bad", e.message || "保存备注失败");
+        }
       }
 
       async function resetMachine(machineId) {
@@ -384,21 +589,54 @@
         }
       }
 
+      async function deleteMachine(machineId) {
+        const id = String(machineId || "").trim();
+        if (!id) return;
+
+        if (!deleteArmed.has(id)) {
+          deleteArmed.add(id);
+          setStatus("statusMach", "warn", `已准备删除：再次点击“删除机器码”将删除 ${id}`);
+          renderMachines();
+          return;
+        }
+
+        try {
+          setStatus("statusMach", "warn", `正在删除：${id}…`);
+          await j(`/v1/admin/machines/${encodeURIComponent(id)}`, { method: "DELETE" });
+          setStatus("statusMach", "good", `已删除机器码：${id}`);
+          await listMachines();
+        } catch (e) {
+          setStatus("statusMach", "bad", e.message || "删除失败");
+        } finally {
+          deleteArmed.delete(id);
+          renderMachines();
+        }
+      }
+
       async function saveAssign() {
-        const machineId = String(state.assignMachineId || "").trim();
-        if (!machineId) return;
+        const machineIds = state.assignMachineIds.map((x) => String(x || "").trim()).filter(Boolean);
+        if (!machineIds.length) return;
         const allowedProfiles = Array.from(state.selected.values()).sort((a, b) => a.localeCompare(b, "zh-CN"));
         try {
           setStatus("statusModal", "warn", "保存中…");
-          await j(`/v1/admin/machines/${encodeURIComponent(machineId)}`, {
-            method: "PUT",
+          const r = await j("/v1/admin/machines/batch-assign", {
+            method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ allowedProfiles }),
+            body: JSON.stringify({ machineIds, allowedProfiles }),
           });
-          const m = state.machines.find((x) => x.machineId === machineId);
-          if (m) m.allowedProfiles = allowedProfiles;
+          for (const machineId of machineIds) {
+            const m = state.machines.find((x) => x.machineId === machineId);
+            if (m) m.allowedProfiles = allowedProfiles;
+          }
           renderMachines();
-          setStatus("statusMach", "good", `已保存：${machineId}（${allowedProfiles.length} 个账号）`);
+          setStatus(
+            "statusMach",
+            "good",
+            `已保存：${machineIds.length} 台设备（统一分配 ${allowedProfiles.length} 个账号）`,
+          );
+          if (r && Array.isArray(r.machineIds)) {
+            state.selectedMachineIds = new Set(r.machineIds.map((x) => String(x || "").trim()).filter(Boolean));
+          }
           closeAssignModal();
         } catch (e) {
           setStatus("statusModal", "bad", e.message || "保存失败");
@@ -417,8 +655,56 @@
         pagerMachines?.reset();
         renderMachines();
       });
+      $("machSelectPage").addEventListener("change", (e) => {
+        const checked = !!e.target.checked;
+        const pageItems = pagerMachines ? pagerMachines.slice(getFilteredMachines()) : getFilteredMachines();
+        for (const m of pageItems) {
+          const machineId = String(m.machineId || "").trim();
+          if (!machineId) continue;
+          if (checked) state.selectedMachineIds.add(machineId);
+          else state.selectedMachineIds.delete(machineId);
+        }
+        renderMachines();
+      });
+      $("btnMachToggleFilteredSel").addEventListener("click", () => {
+        const filteredMachineIds = getFilteredMachines()
+          .map((m) => String(m.machineId || "").trim())
+          .filter(Boolean);
+        if (!filteredMachineIds.length) {
+          setStatus("statusMach", "warn", "当前筛选结果里没有可选择的设备。");
+          return;
+        }
+        const allSelected = filteredMachineIds.every((machineId) => state.selectedMachineIds.has(machineId));
+        for (const machineId of filteredMachineIds) {
+          if (allSelected) state.selectedMachineIds.delete(machineId);
+          else state.selectedMachineIds.add(machineId);
+        }
+        renderMachines();
+      });
+      $("btnMachClearSel").addEventListener("click", () => {
+        state.selectedMachineIds = new Set();
+        renderMachines();
+      });
+      $("btnBatchAssign").addEventListener("click", () => {
+        const machineIds = getOrderedSelectedMachineIds();
+        if (!machineIds.length) {
+          setStatus("statusMach", "warn", "请先选择至少一台设备，再执行批量分配。");
+          return;
+        }
+        openAssignModal(machineIds);
+      });
 
       $("machinesTbody").addEventListener("click", (e) => {
+        const save = e.target.closest("[data-save-note]");
+        if (save) {
+          e.preventDefault();
+          return saveMachineNote(save.getAttribute("data-save-note"));
+        }
+        const del = e.target.closest("[data-delete]");
+        if (del) {
+          e.preventDefault();
+          return deleteMachine(del.getAttribute("data-delete"));
+        }
         const r = e.target.closest("[data-reset]");
         if (r) {
           e.preventDefault();
@@ -430,6 +716,22 @@
         const machineId = t.getAttribute("data-assign");
         if (!machineId) return;
         openAssignModal(machineId);
+      });
+      $("machinesTbody").addEventListener("change", (e) => {
+        const ck = e.target.closest('input[type="checkbox"][data-machine-select]');
+        if (!ck) return;
+        const machineId = String(ck.getAttribute("data-machine-select") || "").trim();
+        if (!machineId) return;
+        if (ck.checked) state.selectedMachineIds.add(machineId);
+        else state.selectedMachineIds.delete(machineId);
+        renderMachines();
+      });
+      $("machinesTbody").addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        const input = e.target.closest("input[data-note-input]");
+        if (!input) return;
+        e.preventDefault();
+        saveMachineNote(input.getAttribute("data-note-input"));
       });
 
       $("btnCloseModal").addEventListener("click", closeAssignModal);
