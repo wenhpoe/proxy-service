@@ -45,17 +45,31 @@ jobs:
             exit 1
           fi
 
-      - name: Write .env (optional, for bundled admin auth)
+      - name: Write .env for bundled release config
         shell: bash
         env:
           PROXY_BUNDLED_ENV_BASE64: ${{ secrets.PROXY_BUNDLED_ENV_BASE64 }}
           PROXY_ADMIN_PASSWORD: ${{ secrets.PROXY_ADMIN_PASSWORD }}
           PROXY_ADMIN_SESSION_SECRET: ${{ secrets.PROXY_ADMIN_SESSION_SECRET }}
+          FLOW_MYSQL_URL: ${{ secrets.FLOW_MYSQL_URL }}
+          FLOW_MYSQL_HOST: ${{ secrets.FLOW_MYSQL_HOST }}
+          FLOW_MYSQL_PORT: ${{ secrets.FLOW_MYSQL_PORT }}
+          FLOW_MYSQL_USER: ${{ secrets.FLOW_MYSQL_USER }}
+          FLOW_MYSQL_PASSWORD: ${{ secrets.FLOW_MYSQL_PASSWORD }}
+          FLOW_MYSQL_DATABASE: ${{ secrets.FLOW_MYSQL_DATABASE }}
+          FLOW_MYSQL_POOL_SIZE: ${{ secrets.FLOW_MYSQL_POOL_SIZE }}
         run: |
+          set -euo pipefail
+
           if [ -n "${PROXY_BUNDLED_ENV_BASE64}" ]; then
             echo "${PROXY_BUNDLED_ENV_BASE64}" | base64 --decode > .env
             echo "✅ wrote .env from PROXY_BUNDLED_ENV_BASE64"
             exit 0
+          fi
+
+          if [ -z "${FLOW_MYSQL_URL}" ] && { [ -z "${FLOW_MYSQL_HOST}" ] || [ -z "${FLOW_MYSQL_USER}" ] || [ -z "${FLOW_MYSQL_DATABASE}" ]; }; then
+            echo "❌ Missing MySQL release config. Set PROXY_BUNDLED_ENV_BASE64 or FLOW_MYSQL_URL, or set FLOW_MYSQL_HOST/FLOW_MYSQL_USER/FLOW_MYSQL_DATABASE secrets."
+            exit 1
           fi
 
           BUNDLED_PASSWORD="${PROXY_ADMIN_PASSWORD:-123456}"
@@ -67,11 +81,26 @@ jobs:
           {
             echo "PROXY_ADMIN_PASSWORD=${BUNDLED_PASSWORD}"
             echo "PROXY_ADMIN_SESSION_SECRET=${SESSION_SECRET}"
+            echo "PROXY_ADMIN_SESSION_TTL_SEC=43200"
+            echo "PROXY_ACTIVATION_CODE_TTL_SEC=604800"
+            echo "PROXY_ADMIN_COOKIE_PERSIST=1"
+            if [ -n "${FLOW_MYSQL_URL}" ]; then
+              echo "FLOW_MYSQL_URL=${FLOW_MYSQL_URL}"
+            else
+              echo "FLOW_MYSQL_HOST=${FLOW_MYSQL_HOST}"
+              echo "FLOW_MYSQL_PORT=${FLOW_MYSQL_PORT:-3306}"
+              echo "FLOW_MYSQL_USER=${FLOW_MYSQL_USER}"
+              echo "FLOW_MYSQL_PASSWORD=${FLOW_MYSQL_PASSWORD}"
+              echo "FLOW_MYSQL_DATABASE=${FLOW_MYSQL_DATABASE}"
+            fi
+            if [ -n "${FLOW_MYSQL_POOL_SIZE}" ]; then
+              echo "FLOW_MYSQL_POOL_SIZE=${FLOW_MYSQL_POOL_SIZE}"
+            fi
           } > .env
           if [ -n "${PROXY_ADMIN_PASSWORD}" ]; then
-            echo "✅ wrote .env for bundling (password from secret + session secret)"
+            echo "✅ wrote .env for bundling (admin + MySQL secrets)"
           else
-            echo "✅ wrote .env for bundling (default password 123456 + generated session secret)"
+            echo "✅ wrote .env for bundling (default password 123456 + MySQL secrets)"
           fi
 
       - name: Import macOS code signing certificate (optional)
