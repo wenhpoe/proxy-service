@@ -14,7 +14,7 @@
         <div class="brand">
           <h1>任务管理</h1>
           <div class="sub">
-            查看共享任务队列、批次和错误；第一版只保留必要排障能力：筛选、取消、重试、查看 slot / 账号 / 错误信息。
+            查看共享任务队列、批次、任务与执行 run；当前页面用于排障和调度核对，直接展示账号、slot、重试链路与输出结果。
           </div>
         </div>
         <div class="top-actions">
@@ -171,8 +171,9 @@
           el.textContent = "";
           return;
         }
+        const cssKind = kind === "ok" ? "good" : kind === "err" ? "bad" : kind || "";
         el.hidden = false;
-        el.className = `status ${kind || ""}`.trim();
+        el.className = `status ${cssKind}`.trim();
         el.textContent = text;
         if (autoHideMs > 0) {
           clearTimeout(setStatus._t);
@@ -184,6 +185,151 @@
         tasks: [],
         batches: [],
       };
+
+      function statusTone(value) {
+        const status = String(value || "").trim().toLowerCase();
+        if (["succeeded", "ready", "idle", "active"].includes(status)) return "good";
+        if (["failed", "cancelled", "expired"].includes(status)) return "bad";
+        return "warn";
+      }
+
+      function renderStatusBadge(value) {
+        const text = String(value || "—");
+        return `<span class="badge ${statusTone(text)} mono">${esc(text)}</span>`;
+      }
+
+      function jsonPreview(value, limit = 180) {
+        let text = "—";
+        try {
+          if (value && typeof value === "object" && Object.keys(value).length) {
+            text = JSON.stringify(value);
+          } else if (typeof value === "string" && value.trim()) {
+            text = value.trim();
+          }
+        } catch {
+          text = "—";
+        }
+        if (text.length > limit) text = `${text.slice(0, limit)}…`;
+        return esc(text);
+      }
+
+      function taskRunCount(task) {
+        return Array.isArray(task?.runs) ? task.runs.length : 0;
+      }
+
+      function taskArtifactCount(task) {
+        return Array.isArray(task?.artifacts) ? task.artifacts.length : 0;
+      }
+
+      function renderTaskDetails(task) {
+        const runs = Array.isArray(task.runs) ? task.runs : [];
+        const artifacts = Array.isArray(task.artifacts) ? task.artifacts : [];
+        const latestRun = runs.length ? runs[runs.length - 1] : null;
+        const runList = runs.length
+          ? runs
+              .map(
+                (run, index) => `
+                  <div class="task-node">
+                    <div class="task-node-head">
+                      <div class="row">
+                        ${renderStatusBadge(run.status)}
+                        <span class="badge mono">run #${index + 1}</span>
+                        <span class="badge mono">slot#${esc(run.slotId || "—")}</span>
+                      </div>
+                      <span class="mono">#${esc(run.id)}</span>
+                    </div>
+                    <div class="task-node-meta">
+                      账号：${esc(run.accountProfile || "—")}<br />
+                      启动：${esc(ts(run.startedAt))} · 结束：${esc(ts(run.finishedAt))}<br />
+                      心跳：${esc(ts(run.heartbeatAt))} · 租约：${esc(ts(run.leaseUntil))}<br />
+                      错误：${esc(run.errorMessage || run.errorCode || "—")}<br />
+                      输出：<span class="mono">${jsonPreview(run.outputSummary, 220)}</span>
+                    </div>
+                  </div>
+                `,
+              )
+              .join("")
+          : `<div class="task-node empty">暂无 run 记录</div>`;
+        const artifactList = artifacts.length
+          ? artifacts
+              .map(
+                (asset, index) => `
+                  <div class="task-node">
+                    <div class="task-node-head">
+                      <div class="row">
+                        <span class="badge mono">输出 ${index + 1}</span>
+                        <span class="badge mono">${esc(asset.assetKind || "output")}</span>
+                      </div>
+                      <span class="mono">${esc(asset.id)}</span>
+                    </div>
+                    <div class="task-node-meta">
+                      文件：${esc(asset.fileName || "—")}<br />
+                      存储：${esc(asset.storageRootKey || "—")} / <span class="mono">${esc(asset.relativePath || "—")}</span><br />
+                      大小：${esc(asset.sizeBytes || "—")} · 类型：${esc(asset.mimeType || "—")}
+                    </div>
+                  </div>
+                `,
+              )
+              .join("")
+          : `<div class="task-node empty">暂无输出文件</div>`;
+        return `
+          <details class="task-deep">
+            <summary>
+              执行链路 · ${runs.length} run / ${artifacts.length} 输出${latestRun ? ` / 最近 ${esc(latestRun.status)}` : ""}
+            </summary>
+            <div class="task-deep-body">
+              <div>
+                <div class="section-label">result payload</div>
+                <div class="code-line">${jsonPreview(task.resultPayload, 260)}</div>
+              </div>
+              <div>
+                <div class="section-label">runs</div>
+                <div class="task-node-group">${runList}</div>
+              </div>
+              <div>
+                <div class="section-label">artifacts</div>
+                <div class="task-node-group">${artifactList}</div>
+              </div>
+            </div>
+          </details>
+        `;
+      }
+
+      function renderBatchTree(batch) {
+        const tasks = Array.isArray(batch.tasks) ? batch.tasks : [];
+        const runCount = tasks.reduce((sum, task) => sum + taskRunCount(task), 0);
+        const taskList = tasks.length
+          ? tasks
+              .map((task) => {
+                const latestRun = Array.isArray(task.runs) && task.runs.length ? task.runs[task.runs.length - 1] : null;
+                return `
+                  <div class="task-node">
+                    <div class="task-node-head">
+                      <div class="row">
+                        ${renderStatusBadge(task.status)}
+                        <span class="badge mono">${esc(task.taskType || "—")}</span>
+                      </div>
+                      <span class="mono">${esc(task.id)}</span>
+                    </div>
+                    <div class="task-node-meta">
+                      账号：${esc(task.requiredAccountProfile || "动态分配")} · run：${esc(taskRunCount(task))} · 输出：${esc(taskArtifactCount(task))}<br />
+                      slot：${esc(task.claimedBySlotId ? `slot#${task.claimedBySlotId}` : "—")} · 最近执行：${esc(
+                        latestRun ? `${latestRun.accountProfile || "—"} / slot#${latestRun.slotId || "—"}` : "—",
+                      )}<br />
+                      错误：${esc(task.errorMessage || task.errorCode || "—")}
+                    </div>
+                  </div>
+                `;
+              })
+              .join("")
+          : `<div class="task-node empty">暂无任务</div>`;
+        return `
+          <details class="task-tree">
+            <summary>任务树 · ${tasks.length} 任务 / ${runCount} run</summary>
+            <div class="task-node-group">${taskList}</div>
+          </details>
+        `;
+      }
 
       function taskFilters() {
         const params = new URLSearchParams();
@@ -231,10 +377,14 @@
                 <td>
                   <div class="mono">${esc(task.id)}</div>
                   <div class="hint mono">batch: ${esc(task.batchId)}</div>
+                  <div class="inline-badges">
+                    <span class="badge mono">${taskRunCount(task)} run</span>
+                    <span class="badge mono">${taskArtifactCount(task)} 输出</span>
+                  </div>
                 </td>
                 <td><span class="mono">${esc(task.targetMachineId || "—")}</span></td>
                 <td>${esc(task.taskType || "—")}</td>
-                <td><span class="tag">${esc(task.status || "—")}</span></td>
+                <td>${renderStatusBadge(task.status)}</td>
                 <td>${esc(task.priority || 0)}</td>
                 <td>${esc(attempts)}</td>
                 <td>
@@ -243,7 +393,8 @@
                 </td>
                 <td>
                   <div>${esc(errorText)}</div>
-                  <div class="hint mono">${esc(JSON.stringify(task.resultPayload || {})).slice(0, 120)}</div>
+                  <div class="code-line">${jsonPreview(task.resultPayload, 140)}</div>
+                  ${renderTaskDetails(task)}
                 </td>
                 <td>${esc(ts(task.updatedAt || task.createdAt))}</td>
                 <td>
@@ -270,9 +421,12 @@
           .map(
             (batch) => `
               <tr>
-                <td class="mono">${esc(batch.id)}</td>
+                <td>
+                  <div class="mono">${esc(batch.id)}</div>
+                  ${renderBatchTree(batch)}
+                </td>
                 <td class="mono">${esc(batch.targetMachineId || "—")}</td>
-                <td><span class="tag">${esc(batch.status || "—")}</span></td>
+                <td>${renderStatusBadge(batch.status)}</td>
                 <td>${esc(batch.priority || 0)}</td>
                 <td>${esc(batch.taskCount || 0)}</td>
                 <td>${esc(ts(batch.expireAt))}</td>

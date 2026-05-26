@@ -5,9 +5,11 @@ const crypto = require('crypto');
 const os = require('os');
 const dns = require('dns');
 const net = require('net');
+const { execFile, execFileSync } = require('child_process');
 
 const { parseSubscriptionToNodes } = require('./decode-sub');
 const taskSystem = require('./core/taskSystem');
+const mysqlCtl = require('./core/mysql');
 let YAML = null;
 try {
   // Optional dependency for YAML file import (Clash config).
@@ -42,6 +44,7 @@ function configEnvHintPath() {
 }
 
 let ENV_LOADED_FROM = null;
+let ENV_LOADED_FILES = [];
 let ENV_BOOTSTRAPPED_MODE = null;
 let ENV_BOOTSTRAPPED_PATH = null;
 const DEFAULT_ADMIN_PASSWORD = String(process.env.PROXY_ADMIN_DEFAULT_PASSWORD || '123456').trim() || '123456';
@@ -99,6 +102,65 @@ function renderAutoCreatedEnv({ password, sessionSecret }) {
   ].join('\n');
 }
 
+function parseEnvKeys(text) {
+  const out = new Set();
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const m = trimmed.match(/^([A-Z0-9_]+)\s*=/i);
+    if (!m) continue;
+    out.add(String(m[1]));
+  }
+  return out;
+}
+
+function renderEnvValue(value) {
+  const v = String(value == null ? '' : value);
+  if (!v) return '';
+  // Avoid accidental comment truncation (#) / whitespace parsing in dotenv.
+  if (/^[A-Za-z0-9_./:@+-]+$/.test(v)) return v;
+  return JSON.stringify(v);
+}
+
+function backfillUserEnvKeysFromCurrentEnv(keys) {
+  if (!isElectronRuntime()) return { ok: false, reason: 'not electron' };
+  const userData = getUserDataDir();
+  if (!userData) return { ok: false, reason: 'userData unavailable' };
+  const fp = path.join(userData, '.env');
+  let raw = null;
+  try {
+    raw = fs.existsSync(fp) ? fs.readFileSync(fp, 'utf8') : null;
+  } catch {
+    raw = null;
+  }
+  if (!raw) return { ok: false, reason: 'missing env file' };
+
+  const existing = parseEnvKeys(raw);
+  const toAppend = [];
+  for (const key of Array.isArray(keys) ? keys : []) {
+    const k = String(key || '').trim();
+    if (!k) continue;
+    if (existing.has(k)) continue;
+    const val = String(process.env[k] || '').trim();
+    if (!val) continue;
+    toAppend.push(`${k}=${renderEnvValue(val)}`);
+  }
+  if (!toAppend.length) return { ok: true, changed: false };
+
+  try {
+    const needsNewline = raw && !raw.endsWith('\n');
+    fs.appendFileSync(
+      fp,
+      `${needsNewline ? '\n' : ''}\n# Backfilled by Flow 代理管理服务\n${toAppend.join('\n')}\n`,
+      'utf8',
+    );
+    return { ok: true, changed: true, appended: toAppend.map((s) => s.split('=')[0]) };
+  } catch (err) {
+    return { ok: false, reason: err?.message || String(err) };
+  }
+}
+
 function ensureUserEnvMaterialized() {
   if (!shouldMaterializeUserEnv()) return;
   const userData = getUserDataDir();
@@ -146,24 +208,54 @@ function ensureUserEnvMaterialized() {
 
 try {
   // Load .env if present (admin machine friendly).
-  // Prefer <userData>/.env (runtime override), then bundled.env (from build time), then proxy-service/.env in dev.
+  // Prefer <userData>/.env for overrides, then keep loading bundled/repo env files
+  // to backfill missing vars such as FLOW_MYSQL_* without clobbering user overrides.
   ensureUserEnvMaterialized();
   const candidates = [];
   const userData = getUserDataDir();
+  const repoEnv = path.join(__dirname, '.env');
   if (userData) candidates.push(path.join(userData, '.env'));
-  candidates.push(...bundledEnvCandidates());
-  candidates.push(path.join(__dirname, '.env'));
+  if (!isElectronRuntime()) {
+    candidates.push(repoEnv);
+    candidates.push(...bundledEnvCandidates());
+  } else {
+    candidates.push(...bundledEnvCandidates());
+    candidates.push(repoEnv);
+  }
 
+  const loaded = [];
+  const seen = new Set();
   for (const p of candidates) {
     try {
-      if (fs.existsSync(p)) {
-        require('dotenv').config({ path: p, override: false });
-        ENV_LOADED_FROM = p;
-        break;
-      }
+      const resolved = path.resolve(p);
+      if (seen.has(resolved) || !fs.existsSync(resolved)) continue;
+      seen.add(resolved);
+      require('dotenv').config({ path: resolved, override: false });
+      loaded.push(resolved);
     } catch {
       // ignore
     }
+  }
+  if (loaded.length) {
+    ENV_LOADED_FILES = loaded;
+    ENV_LOADED_FROM = loaded[0];
+  }
+
+  // For Electron desktop usage, persist critical shared-service settings into <userData>/.env
+  // so subsequent packaged runs don't silently lose MySQL sync capability.
+  // (We only append missing keys; never override existing user edits.)
+  try {
+    backfillUserEnvKeysFromCurrentEnv([
+      'FLOW_MYSQL_URL',
+      'FLOW_MYSQL_HOST',
+      'FLOW_MYSQL_PORT',
+      'FLOW_MYSQL_USER',
+      'FLOW_MYSQL_PASSWORD',
+      'FLOW_MYSQL_DATABASE',
+      'FLOW_MYSQL_POOL_SIZE',
+    ]);
+  } catch {
+    // ignore
   }
 } catch {
   // ignore
@@ -172,6 +264,68 @@ try {
 const PORT = Number(process.env.PROXY_SERVICE_PORT || 3123);
 // Default to LAN-accessible (admin machine in intranet).
 const HOST = process.env.PROXY_SERVICE_HOST || '0.0.0.0';
+const DEFAULT_CHANNEL_CONFIG = {
+  version: 1,
+  channels: [
+    {
+      key: 'flow',
+      label: 'Flow',
+      enabled: true,
+      selected_provider: '1',
+      priority: 100,
+      capabilities: {
+        image_to_image: true,
+        text_to_image: true,
+        upsample: true,
+        download: true,
+      },
+      default_params: {
+        params: {
+          channel_options: {
+            model_name: 'GEM_PIX_2',
+            aspect_ratio: 'IMAGE_ASPECT_RATIO_PORTRAIT',
+          },
+        },
+      },
+      constraints: {},
+      providers: [
+        {
+          key: '1',
+          label: '服务商 1',
+          enabled: true,
+          runner_key: 'flow.provider1',
+        },
+      ],
+    },
+    {
+      key: 'seedance',
+      label: 'Seedance',
+      enabled: true,
+      selected_provider: '1',
+      priority: 200,
+      capabilities: {
+        image_to_image: true,
+        text_to_image: false,
+        upsample: false,
+        download: true,
+      },
+      default_params: {},
+      constraints: {
+        requires_image: true,
+      },
+      providers: [
+        {
+          key: '1',
+          label: '服务商 1',
+          enabled: true,
+          runner_key: 'seedance.provider1',
+          base_url: 'https://testapi.genvia.ai',
+          model: 'dreamina-seedance-2-0-260128',
+        },
+      ],
+    },
+  ],
+};
 
 const RUNTIME = {
   host: HOST,
@@ -191,6 +345,9 @@ const DATA_DIR = process.env.PROXY_SERVICE_DATA_DIR ? path.resolve(process.env.P
 const STORE_PATH = process.env.PROXY_SERVICE_STORE
   ? path.resolve(process.env.PROXY_SERVICE_STORE)
   : path.join(DATA_DIR, 'proxies.json');
+const CHANNEL_CONFIG_PATH = process.env.PROXY_SERVICE_CHANNEL_CONFIG
+  ? path.resolve(process.env.PROXY_SERVICE_CHANNEL_CONFIG)
+  : path.join(DATA_DIR, 'channels.json');
 
 const ACCOUNTS_DIR = process.env.PROXY_SERVICE_ACCOUNTS_DIR
   ? path.resolve(process.env.PROXY_SERVICE_ACCOUNTS_DIR)
@@ -261,11 +418,129 @@ function addSecondsIso(seconds) {
   return toChinaIso(t);
 }
 
+function safeJsonParseText(text, fallback = null) {
+  try {
+    return JSON.parse(String(text || ''));
+  } catch {
+    return fallback;
+  }
+}
+
+function cloneJson(value) {
+  return safeJsonParseText(JSON.stringify(value), value);
+}
+
+function normalizeProviderConfig(provider, fallbackKey = '1') {
+  const raw = provider && typeof provider === 'object' ? provider : {};
+  const key = String(raw.key || raw.id || fallbackKey).trim() || fallbackKey;
+  return {
+    key,
+    label: String(raw.label || `服务商 ${key}`).trim() || `服务商 ${key}`,
+    enabled: raw.enabled !== false,
+    runner_key: raw.runner_key ? String(raw.runner_key).trim() : undefined,
+    base_url: raw.base_url ? String(raw.base_url).trim() : undefined,
+    model: raw.model ? String(raw.model).trim() : undefined,
+    api_key: raw.api_key ? String(raw.api_key).trim() : undefined,
+    extra: raw.extra && typeof raw.extra === 'object' ? raw.extra : undefined,
+  };
+}
+
+function normalizeChannelConfig(input) {
+  const raw = input && typeof input === 'object' ? input : {};
+  const fallback = cloneJson(DEFAULT_CHANNEL_CONFIG);
+  const sourceChannels = Array.isArray(raw.channels) && raw.channels.length ? raw.channels : fallback.channels;
+  const channels = sourceChannels
+    .map((channel, index) => {
+      const item = channel && typeof channel === 'object' ? channel : {};
+      const key = String(item.key || item.channel || '').trim().toLowerCase();
+      if (!key) return null;
+      const rawProviders = Array.isArray(item.providers) && item.providers.length ? item.providers : [{ key: '1', label: '服务商 1', enabled: true }];
+      const providers = rawProviders
+        .map((provider, providerIndex) => normalizeProviderConfig(provider, String(providerIndex + 1)))
+        .filter((provider, providerIndex, arr) => arr.findIndex((it) => it.key === provider.key) === providerIndex);
+      const enabledProviders = providers.filter((provider) => provider.enabled !== false);
+      const selectedProviderRaw = String(item.selected_provider || item.selectedProvider || '').trim();
+      const selectedProvider =
+        (selectedProviderRaw && providers.find((provider) => provider.key === selectedProviderRaw)?.key) ||
+        enabledProviders[0]?.key ||
+        providers[0]?.key ||
+        '1';
+      return {
+        key,
+        label: String(item.label || key).trim() || key,
+        enabled: item.enabled !== false,
+        selected_provider: selectedProvider,
+        providers,
+        priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : undefined,
+        capabilities: item.capabilities && typeof item.capabilities === 'object' ? item.capabilities : {},
+        default_params: item.default_params && typeof item.default_params === 'object' ? item.default_params : {},
+        constraints: item.constraints && typeof item.constraints === 'object' ? item.constraints : {},
+        order: Number.isFinite(Number(item.order)) ? Number(item.order) : index,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.order - right.order)
+    .map(({ order, ...rest }) => rest);
+  return {
+    version: Number.isFinite(Number(raw.version)) ? Number(raw.version) : 1,
+    channels,
+  };
+}
+
+function readChannelConfig() {
+  try {
+    if (fs.existsSync(CHANNEL_CONFIG_PATH)) {
+      const parsed = safeJsonParseText(fs.readFileSync(CHANNEL_CONFIG_PATH, 'utf8'), null);
+      if (parsed && typeof parsed === 'object') return normalizeChannelConfig(parsed);
+    }
+  } catch {
+    // ignore
+  }
+  return normalizeChannelConfig(DEFAULT_CHANNEL_CONFIG);
+}
+
+function writeChannelConfig(config) {
+  const normalized = normalizeChannelConfig(config);
+  fs.mkdirSync(path.dirname(CHANNEL_CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(CHANNEL_CONFIG_PATH, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+  return normalized;
+}
+
+function buildClientChannelCatalog(config) {
+  const normalized = normalizeChannelConfig(config);
+  return {
+    version: normalized.version,
+    channels: normalized.channels
+      .filter((channel) => channel.enabled !== false)
+      .map((channel) => ({
+        key: channel.key,
+        label: channel.label,
+        enabled: true,
+        selected_provider: channel.selected_provider,
+        providers: channel.providers.filter((provider) => provider.enabled !== false).map((provider) => ({
+          key: provider.key,
+          label: provider.label,
+          enabled: true,
+          base_url: provider.base_url || undefined,
+        })),
+      })),
+  };
+}
+
 function isExpiredIso(expiresAt) {
   if (!expiresAt) return false;
   const t = Date.parse(String(expiresAt));
   if (!Number.isFinite(t)) return false;
   return t <= Date.now();
+}
+
+function normalizeBoolish(value) {
+  if (value === true || value === false) return value;
+  if (value == null) return null;
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : value;
+  if (raw === 1 || raw === '1' || raw === 'true' || raw === 'yes' || raw === 'y' || raw === 'on') return true;
+  if (raw === 0 || raw === '0' || raw === 'false' || raw === 'no' || raw === 'n' || raw === 'off') return false;
+  return null;
 }
 
 function timingSafeEqualStr(a, b) {
@@ -381,10 +656,78 @@ function readStore() {
     if (!data.profiles || typeof data.profiles !== 'object') data.profiles = {};
     if (!Array.isArray(data.pool)) data.pool = [];
     if (!Array.isArray(data.nodes)) data.nodes = [];
+    if (!Array.isArray(data.activationCodes)) data.activationCodes = [];
+    if (!data.machines || typeof data.machines !== 'object') data.machines = {};
+
+    // Backward compatibility: old snapshots may have enabled as 0/1 or string.
+    for (const it of data.pool) {
+      if (!it || typeof it !== 'object') continue;
+      if (!Object.prototype.hasOwnProperty.call(it, 'enabled')) continue;
+      const v = normalizeBoolish(it.enabled);
+      if (v == null) continue;
+      it.enabled = v;
+    }
+    for (const it of data.nodes) {
+      if (!it || typeof it !== 'object') continue;
+      if (!Object.prototype.hasOwnProperty.call(it, 'enabled')) continue;
+      const v = normalizeBoolish(it.enabled);
+      if (v == null) continue;
+      it.enabled = v;
+    }
     return data;
   } catch {
     return { version: 1, profiles: {}, pool: [], nodes: [] };
   }
+}
+
+let MYSQL_STORE_MIRROR_QUEUE = Promise.resolve();
+let MYSQL_STORE_MIRROR_PENDING = null;
+let MYSQL_STORE_MIRROR_RUNNING = false;
+let MYSQL_STORE_MIRROR_LAST = null;
+let MYSQL_STORE_MIRROR_DISABLED_LOGGED = false;
+
+function scheduleMysqlStoreMirror(payload, { reason = 'store_write' } = {}) {
+  MYSQL_STORE_MIRROR_PENDING = payload;
+  const run = async () => {
+    if (MYSQL_STORE_MIRROR_RUNNING) return;
+    MYSQL_STORE_MIRROR_RUNNING = true;
+    try {
+      // Coalesce multiple store writes into the latest snapshot.
+      // This reduces load during batch operations (e.g. Flow precheck with concurrency).
+      // eslint-disable-next-line no-unmodified-loop-condition
+      while (MYSQL_STORE_MIRROR_PENDING) {
+        const snapshot = MYSQL_STORE_MIRROR_PENDING;
+        MYSQL_STORE_MIRROR_PENDING = null;
+        const at = nowIso();
+        try {
+          const r = await taskSystem.mirrorStoreSnapshot(snapshot);
+          if (r && r.ok === false) {
+            MYSQL_STORE_MIRROR_LAST = { at, ok: false, reason: r.reason || 'mirror skipped', summary: null };
+            if (String(r.reason || '').toLowerCase().includes('mysql disabled')) {
+              if (!MYSQL_STORE_MIRROR_DISABLED_LOGGED) {
+                MYSQL_STORE_MIRROR_DISABLED_LOGGED = true;
+                console.warn('⚠️ MySQL store mirror skipped: mysql disabled (missing FLOW_MYSQL_*).');
+              }
+            } else {
+              console.warn(`⚠️ MySQL store mirror skipped: ${String(r.reason || 'unknown').slice(0, 200)}`);
+            }
+          } else {
+            MYSQL_STORE_MIRROR_LAST = { at, ok: true, reason: String(reason || 'store_write').slice(0, 60), summary: r?.summary || null };
+            MYSQL_STORE_MIRROR_DISABLED_LOGGED = false;
+          }
+        } catch (err) {
+          const msg = err && err.message ? String(err.message) : String(err);
+          MYSQL_STORE_MIRROR_LAST = { at, ok: false, reason: String(reason || 'store_write').slice(0, 60), error: msg.slice(0, 280) };
+          console.warn(`⚠️ MySQL store mirror failed: ${msg}`);
+        }
+      }
+    } finally {
+      MYSQL_STORE_MIRROR_RUNNING = false;
+    }
+  };
+
+  MYSQL_STORE_MIRROR_QUEUE = MYSQL_STORE_MIRROR_QUEUE.then(run, run);
+  return MYSQL_STORE_MIRROR_QUEUE;
 }
 
 function writeFileAtomicSync(filePath, contents) {
@@ -438,10 +781,7 @@ function writeStore(next) {
     machines: next.machines && typeof next.machines === 'object' ? next.machines : {},
   };
   writeFileAtomicSync(STORE_PATH, JSON.stringify(payload, null, 2));
-  taskSystem.mirrorStoreSnapshot(payload).catch((err) => {
-    const msg = err && err.message ? String(err.message) : String(err);
-    console.warn(`⚠️ MySQL store mirror failed: ${msg}`);
-  });
+  scheduleMysqlStoreMirror(payload, { reason: 'writeStore' });
   return payload;
 }
 
@@ -868,6 +1208,42 @@ function normalizeAllowedProfilesInput(body) {
   return { hasAllowedProfiles, allowedProfiles };
 }
 
+function listClientExecutorMachines({ requesterMachineId }) {
+  const store = readStore();
+  const machines = store.machines && typeof store.machines === 'object' ? store.machines : {};
+  return Object.entries(machines)
+    .filter(([, entry]) => entry && typeof entry === 'object' && entry.tokenHash)
+    .map(([machineId, entry]) => {
+      const allowedProfiles = Array.isArray(entry.allowedProfiles)
+        ? entry.allowedProfiles.map((s) => String(s).trim()).filter(Boolean)
+        : [];
+      return {
+        machineId,
+        isSelf: machineId === requesterMachineId,
+        note: normalizeMachineNote(entry.note),
+        workerLimit: normalizeMachineWorkerLimit(entry.workerLimit, 7),
+        allowedProfiles,
+        canExecute: allowedProfiles.length > 0,
+        activatedAt: entry.activatedAt || null,
+        lastSeenAt: entry.lastSeenAt || null,
+      };
+    })
+    .sort((a, b) => {
+      if (a.isSelf && !b.isSelf) return -1;
+      if (!a.isSelf && b.isSelf) return 1;
+      return a.machineId.localeCompare(b.machineId, 'en');
+    });
+}
+
+function resolveRequestedTargetMachineId({ requesterMachineId, requestedTargetMachineId }) {
+  const targetMachineId = String(requestedTargetMachineId || '').trim() || String(requesterMachineId || '').trim();
+  if (!targetMachineId) throw new Error('targetMachineId required');
+  const machines = listClientExecutorMachines({ requesterMachineId: String(requesterMachineId || '').trim() });
+  const target = machines.find((item) => item.machineId === targetMachineId);
+  if (!target) throw new Error('target machine not found');
+  return targetMachineId;
+}
+
 function clashProxyToShareLink(proxy) {
   const p = proxy && typeof proxy === 'object' ? proxy : null;
   if (!p) return null;
@@ -1061,9 +1437,12 @@ function pickRandomEnabled(pool) {
   const enabled = pool.filter((x) => x && x.enabled !== false);
   if (!enabled.length) return null;
 
+  const flowHealthy = enabled.filter((x) => isFlowPoolItemHealthy(x));
+  const base = flowHealthy.length ? flowHealthy : enabled;
+
   // Prefer pool items that previously passed the check (proxy check or node reachability check).
-  const ok = enabled.filter((x) => x.lastCheckOk === true);
-  const candidates = ok.length ? ok : enabled;
+  const ok = base.filter((x) => x.lastCheckOk === true);
+  const candidates = ok.length ? ok : base;
 
   // Prefer ports that are less likely to be blocked by Chromium "unsafe port" rules.
   // Vendors sometimes return proxies on 444/445 which can break in Chromium even if curl works.
@@ -1088,7 +1467,7 @@ function pickRandomEnabled(pool) {
     }
   }
 
-  const preferred = enabled.filter((it) => {
+  const preferred = base.filter((it) => {
     const p = portOf(it);
     if (!p) return true;
     return !avoid.has(p);
@@ -1100,8 +1479,16 @@ function pickRandomEnabled(pool) {
     return !avoid.has(p);
   });
 
-  const list = preferred2.length ? preferred2 : candidates.length ? candidates : preferred.length ? preferred : enabled;
+  const list = preferred2.length ? preferred2 : candidates.length ? candidates : preferred.length ? preferred : base;
   return list[Math.floor(Math.random() * list.length)];
+}
+
+function isFlowPoolItemHealthy(item) {
+  if (!item || typeof item !== 'object') return false;
+  if (String(item.flowCheckStatus || '').trim().toLowerCase() !== 'ok') return false;
+  const expireAt = typeof item.flowCheckExpireAt === 'string' ? item.flowCheckExpireAt.trim() : '';
+  if (!expireAt) return true;
+  return !isExpiredIso(expireAt);
 }
 
 function pickRandomEnabledNode(nodes) {
@@ -1140,6 +1527,112 @@ function getPoolCheckDefaults() {
   return { url: urlRaw, method, timeoutMs: clamped };
 }
 
+function getPoolFlowCheckDefaults() {
+  const urlRaw =
+    String(process.env.PROXY_POOL_FLOW_CHECK_URL || '').trim() || 'https://labs.google/fx/tools/flow';
+  const timeoutRaw = process.env.PROXY_POOL_FLOW_CHECK_TIMEOUT_MS;
+  const ttlRaw = process.env.PROXY_POOL_FLOW_CHECK_TTL_SECONDS;
+  const failTtlRaw = process.env.PROXY_POOL_FLOW_CHECK_FAIL_TTL_SECONDS;
+  const timeoutMsParsed = timeoutRaw != null ? Number(timeoutRaw) : NaN;
+  const ttlParsed = ttlRaw != null ? Number(ttlRaw) : NaN;
+  const failTtlParsed = failTtlRaw != null ? Number(failTtlRaw) : NaN;
+  return {
+    url: urlRaw,
+    timeoutMs: Number.isFinite(timeoutMsParsed) ? Math.min(120000, Math.max(1500, Math.floor(timeoutMsParsed))) : 15000,
+    ttlSeconds: Number.isFinite(ttlParsed) ? Math.min(24 * 3600, Math.max(60, Math.floor(ttlParsed))) : 1800,
+    failTtlSeconds: Number.isFinite(failTtlParsed)
+      ? Math.min(24 * 3600, Math.max(60, Math.floor(failTtlParsed)))
+      : 3600,
+  };
+}
+
+function isFlowCheckRealHeadersEnabled() {
+  const raw = String(process.env.PROXY_POOL_FLOW_CHECK_REAL_HEADERS || '').trim().toLowerCase();
+  if (!raw) return true; // default on: reduce Playwright UA fingerprint in prechecks
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'n' || raw === 'off') return false;
+  return true;
+}
+
+function defaultFlowCheckUserAgent() {
+  // Keep this roughly aligned with the real Chrome stable version around 2026-05 (M148).
+  // Users can override via PROXY_POOL_FLOW_CHECK_USER_AGENT.
+  return (
+    String(process.env.PROXY_POOL_FLOW_CHECK_USER_AGENT || '').trim() ||
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.97 Safari/537.36'
+  );
+}
+
+function isValidHeaderName(name) {
+  const n = String(name || '').trim();
+  if (!n) return false;
+  if (n.startsWith(':')) return false; // pseudo headers are not allowed here
+  // Be conservative: allow a common safe subset.
+  return /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(n);
+}
+
+function safeJsonParseObject(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  try {
+    const v = JSON.parse(s);
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    return v;
+  } catch {
+    return null;
+  }
+}
+
+function defaultFlowCheckHeaders() {
+  const acceptLanguage =
+    String(process.env.PROXY_POOL_FLOW_CHECK_ACCEPT_LANGUAGE || '').trim() || 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7';
+  const chromeMajor = String(process.env.PROXY_POOL_FLOW_CHECK_CHROME_MAJOR || '').trim() || '148';
+  // A realistic top-level navigation header set. (Some values are advisory; servers typically ignore extras.)
+  return {
+    Accept:
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': acceptLanguage,
+    'Cache-Control': 'max-age=0',
+    Pragma: 'no-cache',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-User': '?1',
+    'Sec-Fetch-Dest': 'document',
+    'sec-ch-ua': `"Not=A?Brand";v="99", "Google Chrome";v="${chromeMajor}", "Chromium";v="${chromeMajor}"`,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"macOS"',
+  };
+}
+
+function getFlowCheckRequestContextOptions({ proxy }) {
+  const proxyCfg = toPlainProxyConfig(proxy);
+  if (!proxyCfg) throw new Error('invalid proxy');
+
+  if (!isFlowCheckRealHeadersEnabled()) {
+    return {
+      proxy: proxyCfg,
+      ignoreHTTPSErrors: true,
+    };
+  }
+
+  const jsonOverride = safeJsonParseObject(process.env.PROXY_POOL_FLOW_CHECK_HEADERS_JSON);
+  const base = jsonOverride || defaultFlowCheckHeaders();
+  const extraHTTPHeaders = {};
+  for (const key of Object.keys(base || {})) {
+    if (!isValidHeaderName(key)) continue;
+    const value = base[key];
+    if (value == null) continue;
+    extraHTTPHeaders[key] = String(value);
+  }
+
+  return {
+    proxy: proxyCfg,
+    ignoreHTTPSErrors: true,
+    userAgent: defaultFlowCheckUserAgent(),
+    extraHTTPHeaders,
+  };
+}
+
 function getNodeCheckDefaults() {
   const timeoutRaw = process.env.PROXY_NODES_CHECK_TIMEOUT_MS;
   const timeoutMsParsed = timeoutRaw != null ? Number(timeoutRaw) : NaN;
@@ -1152,6 +1645,186 @@ function sleepMs(ms) {
   const n = Number(ms);
   const clamped = Number.isFinite(n) ? Math.min(60_000, Math.max(0, Math.floor(n))) : 0;
   return new Promise((r) => setTimeout(r, clamped));
+}
+
+function addSecondsIsoLocal(seconds) {
+  const sec = Number(seconds);
+  const clamped = Number.isFinite(sec) ? Math.max(1, Math.floor(sec)) : 1;
+  return new Date(Date.now() + clamped * 1000).toISOString();
+}
+
+function toPlainProxyConfig(proxy) {
+  if (!proxy || typeof proxy !== 'object') return null;
+  const server = typeof proxy.server === 'string' ? proxy.server.trim() : '';
+  if (!server) return null;
+  const out = { server };
+  if (typeof proxy.username === 'string') out.username = proxy.username;
+  if (typeof proxy.password === 'string') out.password = proxy.password;
+  if (typeof proxy.bypass === 'string' && proxy.bypass.trim()) out.bypass = proxy.bypass.trim();
+  return out;
+}
+
+function ensureNodeProxyScriptPath() {
+  const candidates = [
+    String(process.env.FLOW_NODE_PROXY_HELPER || '').trim(),
+    path.resolve(__dirname, '..', '..', 'auto-gen', 'tools', 'ensure_node_proxy.js'),
+    '/Users/wen/work/auto-gen/tools/ensure_node_proxy.js',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // ignore
+    }
+  }
+  throw new Error('missing ensure_node_proxy.js helper');
+}
+
+let NODE_PROXY_HELPER_RUNNER = null;
+function resolveNodeProxyHelperRunner() {
+  if (NODE_PROXY_HELPER_RUNNER) return NODE_PROXY_HELPER_RUNNER;
+
+  // In plain Node runtime, process.execPath is already `node`, so it's fine.
+  if (!isElectronRuntime()) {
+    NODE_PROXY_HELPER_RUNNER = { bin: process.execPath, env: process.env, mode: 'node' };
+    return NODE_PROXY_HELPER_RUNNER;
+  }
+
+  // In Electron runtime, process.execPath is the Electron app binary. Executing it will spawn
+  // additional app instances that show up in Dock/任务栏. Prefer a real `node` binary to run helpers.
+  const candidates = [
+    String(process.env.FLOW_NODE_PROXY_HELPER_NODE_BIN || '').trim(),
+    String(process.env.NODE_BINARY || '').trim(),
+    'node',
+    '/opt/homebrew/bin/node',
+    '/usr/local/bin/node',
+    '/usr/bin/node',
+  ].filter(Boolean);
+
+  for (const bin of candidates) {
+    try {
+      const out = execFileSync(bin, ['-v'], { timeout: 5000 });
+      const ver = String(out || '').trim();
+      if (/^v\\d+\\./.test(ver)) {
+        NODE_PROXY_HELPER_RUNNER = { bin, env: process.env, mode: 'node-bin' };
+        return NODE_PROXY_HELPER_RUNNER;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Fallback: run Electron binary in Node mode. This avoids launching the GUI app in most cases.
+  NODE_PROXY_HELPER_RUNNER = {
+    bin: process.execPath,
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    mode: 'electron-as-node',
+  };
+  return NODE_PROXY_HELPER_RUNNER;
+}
+
+function ensureNodeProxyForFlowCheck(nodeLink) {
+  return new Promise((resolve, reject) => {
+    const helper = ensureNodeProxyScriptPath();
+    const runner = resolveNodeProxyHelperRunner();
+    execFile(
+      runner.bin,
+      [helper, String(nodeLink || '').trim()],
+      { timeout: 120000, env: runner.env },
+      (err, stdout, stderr) => {
+      if (err) {
+        const msg = stderr ? String(stderr).trim() : err.message || 'ensure node proxy failed';
+        reject(new Error(msg));
+        return;
+      }
+      try {
+        const payload = JSON.parse(String(stdout || '{}'));
+        const proxy = toPlainProxyConfig(payload?.proxy);
+        if (!proxy) throw new Error('helper returned empty proxy');
+        resolve({
+          proxy,
+          via: payload?.via ? String(payload.via) : 'sing-box',
+          helperPath: helper,
+        });
+      } catch (parseErr) {
+        reject(parseErr);
+      }
+      },
+    );
+  });
+}
+
+function classifyFlowCheckResult({ httpStatus, finalUrl, textSnippet, error }) {
+  const url = String(finalUrl || '').trim();
+  const snippet = String(textSnippet || '').slice(0, 4000);
+  const haystack = `${url}\n${snippet}`.toLowerCase();
+  if (error) {
+    return { ok: false, status: 'fail', reason: 'network_error', detail: String(error).slice(0, 280) };
+  }
+  if (haystack.includes('unsupported-country') || haystack.includes('not available in your country')) {
+    return { ok: false, status: 'fail', reason: 'geo_blocked', detail: 'Flow region blocked' };
+  }
+  if (
+    haystack.includes('public_error_unusual_activity')
+    || haystack.includes('recaptcha evaluation failed')
+    || haystack.includes('unusual activity')
+  ) {
+    return { ok: false, status: 'fail', reason: 'risk_blocked', detail: 'Flow unusual activity / reCAPTCHA risk' };
+  }
+  if (haystack.includes('chrome-error://chromewebdata')) {
+    return { ok: false, status: 'fail', reason: 'browser_error', detail: 'chromium proxy error page' };
+  }
+  if (typeof httpStatus === 'number' && (httpStatus < 200 || httpStatus >= 400)) {
+    return { ok: false, status: 'fail', reason: 'http_error', detail: `HTTP ${httpStatus}` };
+  }
+  if (url && /labs\.google\/fx\/tools\/flow/i.test(url)) {
+    return { ok: true, status: 'ok', reason: 'flow_ok', detail: 'Flow page reachable' };
+  }
+  return { ok: true, status: 'ok', reason: 'reachable', detail: `reachable ${url || 'flow'}` };
+}
+
+async function performFlowProxyCheck(proxy, { url, timeoutMs }) {
+  let request;
+  try {
+    ({ request } = require('playwright-core'));
+  } catch {
+    throw new Error('missing dependency: playwright-core');
+  }
+  const ctxOptions = getFlowCheckRequestContextOptions({ proxy });
+
+  const startedAt = Date.now();
+  let ctx = null;
+  let httpStatus = null;
+  let finalUrl = '';
+  let textSnippet = '';
+  let rawError = null;
+  try {
+    ctx = await request.newContext(ctxOptions);
+    const resp = await ctx.fetch(url, { method: 'GET', timeout: timeoutMs });
+    httpStatus = resp.status();
+    finalUrl = typeof resp.url === 'function' ? String(resp.url() || '') : '';
+    textSnippet = String(await resp.text()).slice(0, 4000);
+  } catch (err) {
+    rawError = err && err.message ? String(err.message) : String(err);
+  } finally {
+    if (ctx) {
+      try {
+        await ctx.dispose();
+      } catch {
+        // ignore
+      }
+    }
+  }
+  const ms = Date.now() - startedAt;
+  const classified = classifyFlowCheckResult({ httpStatus, finalUrl, textSnippet, error: rawError });
+  return {
+    ...classified,
+    ms,
+    httpStatus,
+    finalUrl: finalUrl || url,
+    snippet: textSnippet,
+    error: rawError,
+  };
 }
 
 function isPoolAutoCheckEnabled() {
@@ -1184,6 +1857,46 @@ function getPoolNodeAutoToggleDefaults() {
   const timeoutClamped = Math.min(60_000, Math.max(500, Math.floor(timeoutMs)));
 
   return { intervalMs: intervalClamped, tries: triesClamped, tryDelayMs: delayClamped, timeoutMs: timeoutClamped };
+}
+
+function isPoolFlowAutoCheckEnabled() {
+  // Default follow PROXY_POOL_AUTOCHECK to reduce surprises.
+  const raw = String(process.env.PROXY_POOL_FLOW_AUTOCHECK || '').trim().toLowerCase();
+  if (!raw) return isPoolAutoCheckEnabled();
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'n' || raw === 'off') return false;
+  return true;
+}
+
+function getPoolFlowAutoCheckDefaults() {
+  const defaults = getPoolFlowCheckDefaults();
+
+  const intervalRaw = process.env.PROXY_POOL_FLOW_AUTOCHECK_INTERVAL_MS;
+  const intervalParsed = intervalRaw != null ? Number(intervalRaw) : NaN;
+  const intervalMs = Number.isFinite(intervalParsed) ? intervalParsed : 5 * 60_000;
+  const intervalClamped = Math.min(60 * 60 * 1000, Math.max(60_000, Math.floor(intervalMs)));
+
+  const maxRaw = process.env.PROXY_POOL_FLOW_AUTOCHECK_MAX_ITEMS;
+  const maxParsed = maxRaw != null ? Number(maxRaw) : NaN;
+  const maxItems = Number.isFinite(maxParsed) ? Math.floor(maxParsed) : 4;
+  const maxItemsClamped = Math.min(20, Math.max(1, maxItems));
+
+  const disableRaw = String(process.env.PROXY_POOL_FLOW_AUTOCHECK_DISABLE_ON_FAIL || '').trim().toLowerCase();
+  const disableOnFail = disableRaw ? !(disableRaw === '0' || disableRaw === 'false' || disableRaw === 'no' || disableRaw === 'off') : true;
+
+  return {
+    intervalMs: intervalClamped,
+    maxItems: maxItemsClamped,
+    disableOnFail,
+    url: defaults.url,
+    timeoutMs: defaults.timeoutMs,
+  };
+}
+
+function shouldNodeAutoToggleRequireFlowOk() {
+  const raw = String(process.env.PROXY_POOL_NODE_AUTOTOGGLE_REQUIRE_FLOW_OK || '').trim().toLowerCase();
+  if (!raw) return true; // default on (safer)
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'n' || raw === 'off') return false;
+  return true;
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -1428,12 +2141,20 @@ async function runPoolNodeAutoToggleOnce({ reason = 'interval' } = {}) {
         it.lastCheckMethod = null;
         it.lastCheckHttpStatus = null;
 
+        const flowStatus = String(it.flowCheckStatus || '').trim().toLowerCase();
+        const flowFailActive = flowStatus === 'fail' && !isExpiredIso(it.flowCheckExpireAt);
+        const requireFlowOk = shouldNodeAutoToggleRequireFlowOk();
+        const flowOkActive = isFlowPoolItemHealthy(it);
+
         if (stable === 'ok' && it.enabled === false) {
-          it.enabled = true;
-          it.autoToggledAt = checkedAt;
-          it.autoToggledTo = true;
-          it.autoToggledReason = `stable ok ${okCount}/${cfg.tries}`;
-          on += 1;
+          // Do not auto-enable a node that recently failed the Flow precheck.
+          if (!flowFailActive && (!requireFlowOk || flowOkActive)) {
+            it.enabled = true;
+            it.autoToggledAt = checkedAt;
+            it.autoToggledTo = true;
+            it.autoToggledReason = `stable ok ${okCount}/${cfg.tries}`;
+            on += 1;
+          }
         } else if (stable === 'fail' && it.enabled !== false) {
           it.enabled = false;
           it.autoToggledAt = checkedAt;
@@ -1517,6 +2238,220 @@ function startPoolNodeAutoToggleLoop(server) {
   }
 }
 
+let POOL_FLOW_AUTOCHECK_TIMER = null;
+let POOL_FLOW_AUTOCHECK_RUNNING = false;
+let POOL_FLOW_AUTOCHECK_LAST = null;
+
+function isPoolFlowAutoCheckLogEnabled() {
+  const raw = String(process.env.PROXY_POOL_FLOW_AUTOCHECK_LOG || '').trim().toLowerCase();
+  if (!raw) return false;
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'n' || raw === 'off') return false;
+  return true;
+}
+
+function isFlowCheckStale(item) {
+  if (!item || typeof item !== 'object') return true;
+  const status = String(item.flowCheckStatus || '').trim().toLowerCase();
+  if (!status) return true;
+  const expireAt = typeof item.flowCheckExpireAt === 'string' ? item.flowCheckExpireAt.trim() : '';
+  if (!expireAt) return true;
+  return isExpiredIso(expireAt);
+}
+
+async function runPoolFlowAutoCheckOnce({ reason = 'interval' } = {}) {
+  if (!isPoolFlowAutoCheckEnabled()) return { ok: true, skipped: true, reason: 'disabled' };
+  if (POOL_FLOW_AUTOCHECK_RUNNING) return { ok: true, skipped: true, reason: 'busy' };
+
+  POOL_FLOW_AUTOCHECK_RUNNING = true;
+  const startedAt = Date.now();
+  const checkedAt = nowIso();
+
+  let considered = 0;
+  let checked = 0;
+  let ok = 0;
+  let fail = 0;
+  let disabled = 0;
+  let errors = 0;
+
+  try {
+    const cfg = getPoolFlowAutoCheckDefaults();
+    const store0 = readStore();
+    const pool0 = listPoolItems(store0);
+
+    // Check items with stale flow-check status.
+    // - Always include enabled items.
+    // - Also include items that were auto-disabled by flow checks, so they can self-heal after fail TTL expires.
+    // Prefer candidates that passed the basic reachability check to avoid heavy retries on dead nodes.
+    const candidates = pool0
+      .filter((it) => it && typeof it === 'object')
+      .filter((it) => {
+        const enabled = it.enabled !== false;
+        const autoDisabled = it.enabled === false && it.flowAutoDisabledAt;
+        if (!enabled && !autoDisabled) return false;
+        if (!isFlowCheckStale(it)) return false;
+        return it.lastCheckOk === true || it.autoCheckStable === 'ok' || it.lastUsedAt;
+      });
+
+    considered = candidates.length;
+    const slice = candidates.slice(0, cfg.maxItems);
+
+    for (const it of slice) {
+      const id = String(it.id || '').trim();
+      if (!id) continue;
+
+      checked += 1;
+      const kind = poolItemKind(it);
+      let via = kind;
+      let proxy = null;
+      let runtimeError = null;
+      try {
+        if (kind === 'proxy') {
+          proxy = toPlainProxyConfig(it?.proxy);
+          if (!proxy) throw new Error('invalid proxy');
+        } else if (kind === 'node') {
+          const nodeLink = poolItemNodeLink(it?.node);
+          if (!nodeLink) throw new Error('invalid node (missing fullLink)');
+          const resolved = await ensureNodeProxyForFlowCheck(nodeLink);
+          proxy = resolved.proxy;
+          via = resolved.via || 'sing-box';
+        } else {
+          throw new Error('unsupported pool item kind');
+        }
+      } catch (err) {
+        runtimeError = err && err.message ? String(err.message) : String(err);
+      }
+
+      let result = null;
+      if (!runtimeError && proxy) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          result = await performFlowProxyCheck(proxy, { url: cfg.url, timeoutMs: cfg.timeoutMs });
+        } catch (err) {
+          runtimeError = err && err.message ? String(err.message) : String(err);
+        }
+      }
+      if (!result) {
+        result = {
+          ok: false,
+          status: 'fail',
+          reason: 'runtime_error',
+          detail: String(runtimeError || 'flow check failed').slice(0, 280),
+          ms: null,
+          httpStatus: null,
+          finalUrl: cfg.url,
+          snippet: '',
+          error: String(runtimeError || 'flow check failed').slice(0, 280),
+        };
+      }
+
+      const defaults = getPoolFlowCheckDefaults();
+      const expireAt = addSecondsIsoLocal(result.ok ? defaults.ttlSeconds : defaults.failTtlSeconds);
+
+      // eslint-disable-next-line no-await-in-loop
+      await patchStoreQueued((s) => {
+        const list = Array.isArray(s.pool) ? s.pool : [];
+        const i = list.findIndex((x) => x && typeof x === 'object' && String(x.id || '') === id);
+        if (i < 0) return { changed: false };
+        const cur = list[i];
+        cur.flowCheckAt = checkedAt;
+        cur.flowCheckUrl = cfg.url;
+        cur.flowCheckStatus = result.status;
+        cur.flowCheckOk = !!result.ok;
+        cur.flowCheckExpireAt = expireAt;
+        cur.flowCheckReason = result.reason || null;
+        cur.flowCheckDetail = result.detail || null;
+        cur.flowCheckError = result.error || '';
+        cur.flowCheckHttpStatus = Number.isFinite(result.httpStatus) ? result.httpStatus : null;
+        cur.flowCheckMs = Number.isFinite(result.ms) ? result.ms : null;
+        cur.flowCheckFinalUrl = result.finalUrl || cfg.url;
+        cur.flowCheckVia = via || kind;
+
+        if (result.ok && cur.enabled === false && cur.flowAutoDisabledAt) {
+          cur.enabled = true;
+          cur.flowAutoReEnabledAt = checkedAt;
+        }
+
+        if (!result.ok && cfg.disableOnFail && cur.enabled !== false) {
+          cur.enabled = false;
+          cur.flowAutoDisabledAt = checkedAt;
+          cur.flowAutoDisabledReason = String(result.reason || 'flow_check_fail').slice(0, 60);
+        }
+
+        list[i] = cur;
+        s.pool = list;
+        return { changed: true };
+      });
+
+      if (result.ok) ok += 1;
+      else {
+        fail += 1;
+        if (cfg.disableOnFail) disabled += 1;
+      }
+      if (runtimeError) errors += 1;
+    }
+
+    const ms = Date.now() - startedAt;
+    POOL_FLOW_AUTOCHECK_LAST = {
+      at: checkedAt,
+      ms,
+      considered,
+      checked,
+      ok,
+      fail,
+      disabled,
+      errors,
+      reason: String(reason || 'interval').slice(0, 40),
+    };
+    if (isPoolFlowAutoCheckLogEnabled() && checked) {
+      console.log(
+        `[pool:flow-auto] checked=${checked} ok=${ok} fail=${fail} disabled=${disabled} ms=${ms} (considered=${considered})`,
+      );
+    }
+    return { ok: true, ...POOL_FLOW_AUTOCHECK_LAST };
+  } catch (e) {
+    const msg = e && e.message ? String(e.message) : String(e);
+    POOL_FLOW_AUTOCHECK_LAST = { at: checkedAt, error: msg.slice(0, 280) };
+    return { ok: false, error: POOL_FLOW_AUTOCHECK_LAST.error };
+  } finally {
+    POOL_FLOW_AUTOCHECK_RUNNING = false;
+  }
+}
+
+function stopPoolFlowAutoCheckLoop() {
+  if (!POOL_FLOW_AUTOCHECK_TIMER) return;
+  try {
+    clearInterval(POOL_FLOW_AUTOCHECK_TIMER);
+  } catch {
+    // ignore
+  }
+  POOL_FLOW_AUTOCHECK_TIMER = null;
+}
+
+function startPoolFlowAutoCheckLoop(server) {
+  if (!isPoolFlowAutoCheckEnabled()) return;
+  if (POOL_FLOW_AUTOCHECK_TIMER) return;
+
+  const cfg = getPoolFlowAutoCheckDefaults();
+  const tick = () =>
+    runPoolFlowAutoCheckOnce({ reason: 'timer' }).catch((e) => {
+      if (isPoolFlowAutoCheckLogEnabled()) {
+        console.warn('[pool:flow-auto] tick failed:', e?.message || e);
+      }
+    });
+
+  // Delay the first run slightly to avoid competing with startup work.
+  const firstDelayMs = Math.min(60_000, Math.max(2000, Math.floor(cfg.intervalMs / 4)));
+  const first = setTimeout(tick, firstDelayMs);
+  if (typeof first.unref === 'function') first.unref();
+
+  POOL_FLOW_AUTOCHECK_TIMER = setInterval(tick, cfg.intervalMs);
+  if (typeof POOL_FLOW_AUTOCHECK_TIMER.unref === 'function') POOL_FLOW_AUTOCHECK_TIMER.unref();
+
+  if (server && typeof server.once === 'function') {
+    server.once('close', () => stopPoolFlowAutoCheckLoop());
+  }
+}
+
 function ensureAccountsDir() {
   fs.mkdirSync(ACCOUNTS_DIR, { recursive: true });
   return ACCOUNTS_DIR;
@@ -1558,20 +2493,65 @@ function listAccountProfiles() {
     .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
 }
 
+async function listAccountProfilesWithControls() {
+  const profiles = listAccountProfiles();
+  if (!profiles.length || !taskSystem.listAccountControls) {
+    return profiles.map((profile) => ({
+      ...profile,
+      status: 'active',
+      maxConcurrency: taskSystem.DEFAULT_ACCOUNT_MAX_CONCURRENCY || 7,
+      note: '',
+      controlUpdatedAt: null,
+    }));
+  }
+  let controls = [];
+  try {
+    controls = await taskSystem.listAccountControls({ profileNames: profiles.map((profile) => profile.name) });
+  } catch {
+    controls = [];
+  }
+  const byProfile = new Map(
+    (Array.isArray(controls) ? controls : [])
+      .filter((item) => item && item.profileName)
+      .map((item) => [String(item.profileName), item]),
+  );
+  return profiles.map((profile) => {
+    const control = byProfile.get(String(profile.name)) || null;
+    return {
+      ...profile,
+      status: control?.status || 'active',
+      maxConcurrency:
+        control && Number.isFinite(Number(control.maxConcurrency))
+          ? Number(control.maxConcurrency)
+          : taskSystem.DEFAULT_ACCOUNT_MAX_CONCURRENCY || 7,
+      note: control?.note || '',
+      controlUpdatedAt: control?.updatedAt || null,
+    };
+  });
+}
+
 function readAccountStorageState(profile) {
   const fp = accountFilePath(profile);
   const raw = fs.readFileSync(fp, 'utf8');
   return JSON.parse(raw);
 }
 
-function writeAccountStorageState(profile, storageState) {
+function writeAccountStorageStateFile(profile, storageState) {
   const fp = accountFilePath(profile);
   writeFileAtomicSync(fp, JSON.stringify(storageState, null, 2));
-  taskSystem.mirrorAccountStorageState(profile, storageState, { source: 'capture' }).catch((err) => {
-    const msg = err && err.message ? String(err.message) : String(err);
-    console.warn(`⚠️ MySQL account mirror failed for ${profile}: ${msg}`);
-  });
   return fp;
+}
+
+async function persistAccountStorageState(profile, storageState, { source = 'capture' } = {}) {
+  const filePath = writeAccountStorageStateFile(profile, storageState);
+  if (!taskSystem.mirrorAccountStorageState) {
+    return { filePath, mirrored: false, mirrorReason: 'mirror unsupported' };
+  }
+  const mirrorResult = await taskSystem.mirrorAccountStorageState(profile, storageState, { source });
+  if (mirrorResult && mirrorResult.ok === false) {
+    throw new Error(mirrorResult.reason || 'mysql mirror failed');
+  }
+  return { filePath, mirrored: true };
 }
 
 function sha256Hex(s) {
@@ -1734,6 +2714,7 @@ async function fetchUpstreamProxy(profile) {
 }
 
 const app = express();
+writeChannelConfig(readChannelConfig());
 app.disable('x-powered-by');
 app.use(express.json({ limit: '10mb' }));
 
@@ -1797,8 +2778,15 @@ app.get('/health', (_req, res) =>
     actualPort: RUNTIME.actualPort,
     baseUrl: RUNTIME.baseUrl,
     lanUrls: RUNTIME.lanUrls,
+    mysql: {
+      enabled: mysqlCtl.isEnabled(),
+      hasConfig: mysqlCtl.hasMysqlConfig(),
+      mirrorLast: MYSQL_STORE_MIRROR_LAST,
+      mirrorRunning: !!MYSQL_STORE_MIRROR_RUNNING,
+    },
     adminPasswordSource: ADMIN_PASSWORD_SOURCE,
     envLoadedFrom: ENV_LOADED_FROM,
+    envLoadedFiles: ENV_LOADED_FILES,
     envHint: configEnvHintPath(),
     startedAt: RUNTIME.startedAt,
   }),
@@ -1809,11 +2797,18 @@ app.get('/v1/store', requireAdmin, (_req, res) => {
   const poolCheck = getPoolCheckDefaults();
   const nodeCheck = getNodeCheckDefaults();
   const poolNodeAutoToggle = getPoolNodeAutoToggleDefaults();
+  const poolFlowAutoCheck = getPoolFlowAutoCheckDefaults();
   res.json({
     ok: true,
     storePath: STORE_PATH,
     version: store.version || 1,
     updatedAt: store.updatedAt || null,
+    mysql: {
+      enabled: mysqlCtl.isEnabled(),
+      hasConfig: mysqlCtl.hasMysqlConfig(),
+      mirrorLast: MYSQL_STORE_MIRROR_LAST,
+      mirrorRunning: !!MYSQL_STORE_MIRROR_RUNNING,
+    },
     profiles: Object.keys(store.profiles || {}).sort(),
     poolSize: Array.isArray(store.pool) ? store.pool.length : 0,
     nodeSize: Array.isArray(store.nodes) ? store.nodes.length : 0,
@@ -1825,6 +2820,13 @@ app.get('/v1/store', requireAdmin, (_req, res) => {
       running: !!POOL_NODE_AUTOTOGGLE_TIMER,
       busy: !!POOL_NODE_AUTOTOGGLE_RUNNING,
       last: POOL_NODE_AUTOTOGGLE_LAST,
+    },
+    poolFlowAutoCheckEnabled: isPoolFlowAutoCheckEnabled(),
+    poolFlowAutoCheck,
+    poolFlowAutoCheckStatus: {
+      running: !!POOL_FLOW_AUTOCHECK_TIMER,
+      busy: !!POOL_FLOW_AUTOCHECK_RUNNING,
+      last: POOL_FLOW_AUTOCHECK_LAST,
     },
     machines: store.machines ? Object.keys(store.machines).length : 0,
     accountsDir: ACCOUNTS_DIR,
@@ -2505,6 +3507,51 @@ app.post('/v1/pool', (req, res) => {
   res.json({ ok: true, added: added.length, skipped: skipped.length, storeUpdatedAt: written.updatedAt, items: added });
 });
 
+app.post('/v1/pool/add-node', (req, res) => {
+  const linkRaw = typeof req.body?.link === 'string' ? req.body.link.trim() : typeof req.body?.fullLink === 'string' ? req.body.fullLink.trim() : '';
+  if (!linkRaw) return res.status(400).json({ ok: false, error: 'link required' });
+  if (!isNodeLink(linkRaw)) return res.status(400).json({ ok: false, error: 'invalid node link' });
+
+  const nodes = parseSubscriptionToNodes(linkRaw);
+  if (!Array.isArray(nodes) || !nodes.length) {
+    return res.status(400).json({ ok: false, error: 'parse failed: empty node' });
+  }
+  const node = nodes[0];
+  const payload = serializeNodeForPool(node);
+  if (!payload) return res.status(400).json({ ok: false, error: 'parse failed: missing fullLink' });
+
+  const label =
+    typeof req.body?.label === 'string'
+      ? req.body.label.trim()
+      : String(payload.remark || payload.title || '').trim() || '';
+  const enabled = req.body?.enabled === false ? false : true;
+
+  const store = readStore();
+  const pool = listPoolItems(store);
+  const existingNodeLinks = new Set(
+    pool
+      .map((x) => poolItemNodeLink(x?.node))
+      .filter(Boolean),
+  );
+  if (existingNodeLinks.has(payload.fullLink)) {
+    return res.json({ ok: true, added: 0, skipped: 1, reason: 'duplicate', storeUpdatedAt: store.updatedAt || null });
+  }
+
+  const it = {
+    id: newId(),
+    label,
+    enabled,
+    kind: 'node',
+    node: payload,
+    addedAt: nowIso(),
+    lastUsedAt: null,
+  };
+  pool.push(it);
+  store.pool = pool;
+  const written = writeStore(store);
+  return res.json({ ok: true, added: 1, skipped: 0, poolItemId: it.id, item: it, storeUpdatedAt: written.updatedAt });
+});
+
 app.put('/v1/pool/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
   if (!id) return res.status(400).json({ ok: false, error: 'id required' });
@@ -2721,17 +3768,15 @@ app.post('/v1/pool/:id/check', async (req, res) => {
   if (typeof proxy.username === 'string') proxyCfg.username = proxy.username;
   if (typeof proxy.password === 'string') proxyCfg.password = proxy.password;
 
-  let ctx = null;
-  try {
-    ctx = await request.newContext({
-      proxy: proxyCfg,
-      ignoreHTTPSErrors: true,
-    });
+	  let ctx = null;
+	  try {
+	    // Keep the check headers closer to a real browser to avoid proxy vendors blocking Playwright UA.
+	    ctx = await request.newContext(getFlowCheckRequestContextOptions({ proxy: proxyCfg }));
 
-    const resp = await ctx.fetch(url, { method, timeout: timeoutMs });
-    httpStatus = resp.status();
-    success = httpStatus >= 200 && httpStatus < 400;
-  } catch (e) {
+	    const resp = await ctx.fetch(url, { method, timeout: timeoutMs });
+	    httpStatus = resp.status();
+	    success = httpStatus >= 200 && httpStatus < 400;
+	  } catch (e) {
     const msg = e && e.message ? String(e.message) : String(e);
     error = msg.slice(0, 280);
   } finally {
@@ -2791,6 +3836,127 @@ app.post('/v1/pool/:id/check', async (req, res) => {
   });
 });
 
+app.post('/v1/pool/:id/flow-check', async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+
+  const store = readStore();
+  const pool = listPoolItems(store);
+  const idx = pool.findIndex((x) => x && x.id === id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: 'not found' });
+
+  const item = pool[idx];
+  const kind = poolItemKind(item);
+  const defaults = getPoolFlowCheckDefaults();
+  const flowAutoCfg = getPoolFlowAutoCheckDefaults();
+  const checkedAt = nowIso();
+  let url;
+  try {
+    url = sanitizeHttpUrl(typeof req.body?.url === 'string' && req.body.url.trim() ? req.body.url.trim() : defaults.url);
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message || 'invalid url' });
+  }
+
+  let via = kind;
+  let proxy = null;
+  let runtimeError = null;
+  try {
+    if (kind === 'proxy') {
+      proxy = toPlainProxyConfig(item?.proxy);
+      if (!proxy) return res.status(400).json({ ok: false, error: 'invalid proxy' });
+    } else if (kind === 'node') {
+      const nodeLink = poolItemNodeLink(item?.node);
+      if (!nodeLink) return res.status(400).json({ ok: false, error: 'invalid node (missing fullLink)' });
+      const resolved = await ensureNodeProxyForFlowCheck(nodeLink);
+      proxy = resolved.proxy;
+      via = resolved.via || 'sing-box';
+    } else {
+      return res.status(400).json({ ok: false, error: 'unsupported pool item kind' });
+    }
+  } catch (err) {
+    runtimeError = err && err.message ? String(err.message) : String(err);
+  }
+
+  let result = null;
+  if (!runtimeError) {
+    try {
+      result = await performFlowProxyCheck(proxy, { url, timeoutMs: defaults.timeoutMs });
+    } catch (err) {
+      runtimeError = err && err.message ? String(err.message) : String(err);
+    }
+  }
+  if (!result) {
+    result = {
+      ok: false,
+      status: 'fail',
+      reason: 'runtime_error',
+      detail: String(runtimeError || 'flow check failed').slice(0, 280),
+      ms: null,
+      httpStatus: null,
+      finalUrl: url,
+      snippet: '',
+      error: String(runtimeError || 'flow check failed').slice(0, 280),
+    };
+  }
+
+  const expireAt = addSecondsIsoLocal(result.ok ? defaults.ttlSeconds : defaults.failTtlSeconds);
+  const patched = await patchStoreQueued((s) => {
+    const list = Array.isArray(s.pool) ? s.pool : [];
+    const i = list.findIndex((x) => x && typeof x === 'object' && x.id === id);
+    if (i < 0) return { changed: false, missing: true };
+    const cur = list[i];
+    cur.flowCheckAt = checkedAt;
+    cur.flowCheckUrl = url;
+    cur.flowCheckStatus = result.status;
+    cur.flowCheckOk = !!result.ok;
+    cur.flowCheckExpireAt = expireAt;
+    cur.flowCheckReason = result.reason || null;
+    cur.flowCheckDetail = result.detail || null;
+    cur.flowCheckError = result.error || '';
+    cur.flowCheckHttpStatus = Number.isFinite(result.httpStatus) ? result.httpStatus : null;
+    cur.flowCheckMs = Number.isFinite(result.ms) ? result.ms : null;
+    cur.flowCheckFinalUrl = result.finalUrl || url;
+    cur.flowCheckVia = via || kind;
+
+    // Keep pool "enabled" aligned with Flow usability, so selection doesn't keep returning known-bad items.
+    // Only re-enable items we auto-disabled before; do not override manual disables.
+    if (result.ok && cur.enabled === false && cur.flowAutoDisabledAt) {
+      cur.enabled = true;
+      cur.flowAutoReEnabledAt = checkedAt;
+    }
+    if (!result.ok && flowAutoCfg.disableOnFail && cur.enabled !== false) {
+      cur.enabled = false;
+      cur.flowAutoDisabledAt = checkedAt;
+      cur.flowAutoDisabledReason = String(result.reason || 'flow_check_fail').slice(0, 60);
+    }
+
+    list[i] = cur;
+    s.pool = list;
+    return { changed: true, item: cur };
+  });
+
+  return res.json({
+    ok: true,
+    id,
+    kind,
+    via,
+    success: !!result.ok,
+    flowCheckStatus: result.status,
+    flowCheckReason: result.reason || null,
+    detail: result.detail || null,
+    error: result.error || null,
+    url,
+    finalUrl: result.finalUrl || url,
+    timeoutMs: defaults.timeoutMs,
+    ms: Number.isFinite(result.ms) ? result.ms : null,
+    httpStatus: Number.isFinite(result.httpStatus) ? result.httpStatus : null,
+    expireAt,
+    item: patched && patched.ok && patched.item ? patched.item : null,
+    storeUpdatedAt: patched?.storeUpdatedAt || store.updatedAt || null,
+    storePatchError: patched && patched.ok === false ? patched.error || 'store patch failed' : null,
+  });
+});
+
 // --- Activation + account distribution (v1) ---
 
 app.post('/v1/client/activate', (req, res) => {
@@ -2833,6 +3999,22 @@ app.post('/v1/client/activate', (req, res) => {
 
   writeStore(store);
   return res.json({ ok: true, machineId, token });
+});
+
+app.get('/v1/client/device', authClient, (req, res) => {
+  const allowedProfiles = Array.isArray(req.clientMachine.allowedProfiles)
+    ? req.clientMachine.allowedProfiles.map((s) => String(s)).filter(Boolean)
+    : [];
+
+  return res.json({
+    ok: true,
+    machineId: req.clientMachine.machineId,
+    activatedAt: req.clientMachine.activatedAt || null,
+    lastSeenAt: req.clientMachine.lastSeenAt || null,
+    resetAt: req.clientMachine.resetAt || null,
+    workerLimit: normalizeMachineWorkerLimit(req.clientMachine.workerLimit, 7),
+    allowedProfiles,
+  });
 });
 
 app.get('/v1/client/profiles', authClient, (req, res) => {
@@ -2907,11 +4089,13 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
     const allowedItems = policy.items
       .map((x) => ({ ...x, item: byId.get(x.poolItemId) || null }))
       .filter((x) => x.item && x.item.enabled !== false);
+    const preferredAllowedItems = allowedItems.filter((x) => isFlowPoolItemHealthy(x.item));
+    const candidateAllowedItems = preferredAllowedItems.length ? preferredAllowedItems : allowedItems;
 
-    if (allowedItems.length) {
-      const priorities = allowedItems.map((x) => x.priority).filter((n) => Number.isFinite(n));
+    if (candidateAllowedItems.length) {
+      const priorities = candidateAllowedItems.map((x) => x.priority).filter((n) => Number.isFinite(n));
       const best = priorities.length ? Math.min(...priorities) : 0;
-      const bucket = allowedItems.filter((x) => x.priority === best);
+      const bucket = candidateAllowedItems.filter((x) => x.priority === best);
       const sticky =
         policy.stickyPoolItemId && bucket.some((x) => x.poolItemId === policy.stickyPoolItemId)
           ? bucket.find((x) => x.poolItemId === policy.stickyPoolItemId)
@@ -2987,6 +4171,7 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
             policyNoAvailable: true,
             policyItems: policy.items.length,
             policyEnabled: allowedItems.length,
+            policyFlowHealthy: preferredAllowedItems.length,
             policyMissing: availability.missing,
             policyDisabled: availability.disabled,
             policyUnusable: availability.unusable,
@@ -3003,6 +4188,7 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
           policyNoAvailable: true,
           policyItems: policy.items.length,
           policyEnabled: allowedItems.length,
+          policyFlowHealthy: preferredAllowedItems.length,
           policyMissing: availability.missing,
           policyDisabled: availability.disabled,
           policyUnusable: availability.unusable,
@@ -3018,6 +4204,7 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
         policyNoAvailable: true,
         policyItems: policy.items.length,
         policyEnabled: allowedItems.length,
+        policyFlowHealthy: preferredAllowedItems.length,
         policyMissing: availability.missing,
         policyDisabled: availability.disabled,
         policyUnusable: availability.unusable,
@@ -3034,6 +4221,7 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
       policyNoAvailable: true,
       policyItems: policy.items.length,
       policyEnabled: allowedItems.length,
+      policyFlowHealthy: preferredAllowedItems.length,
       policyMissing: availability.missing,
       policyDisabled: availability.disabled,
       policyUnusable: availability.unusable,
@@ -3104,6 +4292,20 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
   return res.json({ ok: true, profile, proxy: null, source: 'none', updatedAt: store.updatedAt || null });
 });
 
+app.get('/v1/client/executor-machines', authClient, (req, res) => {
+  const machineId = req.clientMachine.machineId;
+  return res.json({
+    ok: true,
+    submitMachineId: machineId,
+    machines: listClientExecutorMachines({ requesterMachineId: machineId }),
+  });
+});
+
+app.get('/v1/client/channels', authClient, (_req, res) => {
+  const catalog = buildClientChannelCatalog(readChannelConfig());
+  return res.json({ ok: true, ...catalog });
+});
+
 app.post('/v1/client/assets/register', authClient, async (req, res) => {
   try {
     const result = await taskSystem.registerClientAsset({
@@ -3118,11 +4320,29 @@ app.post('/v1/client/assets/register', authClient, async (req, res) => {
 
 app.post('/v1/client/task-batches', authClient, async (req, res) => {
   try {
+    const targetMachineId = resolveRequestedTargetMachineId({
+      requesterMachineId: req.clientMachine.machineId,
+      requestedTargetMachineId: req.body?.targetMachineId,
+    });
     const batch = await taskSystem.createClientTaskBatch({
       machineId: req.clientMachine.machineId,
+      targetMachineId,
       body: req.body || {},
     });
     return res.json({ ok: true, batch });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.get('/v1/client/task-batches', authClient, async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit);
+    const batches = await taskSystem.listClientTaskBatches({
+      machineId: req.clientMachine.machineId,
+      limit: Number.isFinite(limit) ? limit : 20,
+    });
+    return res.json({ ok: true, batches });
   } catch (err) {
     return sendTaskApiError(res, err);
   }
@@ -3245,10 +4465,10 @@ app.post('/v1/admin/capture/finish/:id', requireAdmin, async (req, res) => {
 
   try {
     const storageState = await item.context.storageState();
-    const fp = writeAccountStorageState(item.profile, storageState);
+    const { filePath } = await persistAccountStorageState(item.profile, storageState, { source: 'capture' });
     CAPTURES.delete(id);
     await safeCloseCapture(item);
-    return res.json({ ok: true, id, profile: item.profile, filePath: fp });
+    return res.json({ ok: true, id, profile: item.profile, filePath });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message || 'capture finish failed' });
   }
@@ -3261,6 +4481,27 @@ app.post('/v1/admin/capture/cancel/:id', requireAdmin, async (req, res) => {
   CAPTURES.delete(id);
   await safeCloseCapture(item);
   return res.json({ ok: true, id });
+});
+
+app.post('/v1/admin/sync/mysql', requireAdmin, async (_req, res) => {
+  try {
+    const result = await taskSystem.syncControlPlaneSnapshot({
+      store: readStore(),
+      accounts: collectLegacyAccountStatesForMirror(),
+      actorId: 'admin',
+      source: 'manual_sync',
+    });
+    if (result && result.ok === false) {
+      throw new Error(result.reason || 'mysql sync failed');
+    }
+    return res.json({
+      ...result,
+      storePath: STORE_PATH,
+      accountsDir: ACCOUNTS_DIR,
+    });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
 });
 
 app.post('/v1/admin/codes', requireAdmin, (req, res) => {
@@ -3424,8 +4665,38 @@ app.delete('/v1/admin/machines/:machineId', requireAdmin, (req, res) => {
   res.json({ ok: true, machineId, storeUpdatedAt: written.updatedAt });
 });
 
-app.get('/v1/admin/accounts', requireAdmin, (_req, res) => {
-  res.json({ ok: true, accountsDir: ACCOUNTS_DIR, profiles: listAccountProfiles() });
+app.get('/v1/admin/accounts', requireAdmin, async (_req, res) => {
+  try {
+    const profiles = await listAccountProfilesWithControls();
+    return res.json({
+      ok: true,
+      accountsDir: ACCOUNTS_DIR,
+      maxAccountConcurrencyLimit: taskSystem.MAX_ACCOUNT_MAX_CONCURRENCY || 32,
+      profiles,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message || 'list accounts failed' });
+  }
+});
+
+app.put('/v1/admin/accounts/:profile/control', requireAdmin, async (req, res) => {
+  let profile;
+  try {
+    profile = sanitizeProfileName(req.params.profile);
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message || 'bad profile' });
+  }
+  try {
+    const control = await taskSystem.upsertAccountControl({
+      profileName: profile,
+      maxConcurrency: req.body?.maxConcurrency,
+      note: req.body?.note,
+      actorId: 'admin',
+    });
+    return res.json({ ok: true, profile, control });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
 });
 
 app.get('/v1/admin/tasks', requireAdmin, async (req, res) => {
@@ -3440,6 +4711,31 @@ app.get('/v1/admin/tasks', requireAdmin, async (req, res) => {
     return res.json({ ok: true, tasks });
   } catch (err) {
     return sendTaskApiError(res, err);
+  }
+});
+
+app.get('/v1/admin/task-stats', requireAdmin, async (req, res) => {
+  try {
+    const stats = await taskSystem.getAdminTaskStats({
+      days: req.query.days,
+      machineId: req.query.machineId,
+    });
+    return res.json({ ok: true, stats });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.get('/v1/admin/channels', requireAdmin, (_req, res) => {
+  return res.json({ ok: true, config: readChannelConfig(), path: CHANNEL_CONFIG_PATH });
+});
+
+app.put('/v1/admin/channels', requireAdmin, (req, res) => {
+  try {
+    const config = writeChannelConfig(req.body || {});
+    return res.json({ ok: true, config, path: CHANNEL_CONFIG_PATH });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err?.message || 'invalid channel config' });
   }
 });
 
@@ -3480,7 +4776,7 @@ app.post('/v1/admin/tasks/:id/retry', requireAdmin, async (req, res) => {
   }
 });
 
-app.put('/v1/admin/accounts/:profile', requireAdmin, (req, res) => {
+app.put('/v1/admin/accounts/:profile', requireAdmin, async (req, res) => {
   let profile;
   try {
     profile = sanitizeProfileName(req.params.profile);
@@ -3492,14 +4788,14 @@ app.put('/v1/admin/accounts/:profile', requireAdmin, (req, res) => {
   try {
     // validate JSON shape
     if (!storageState || typeof storageState !== 'object') throw new Error('invalid storageState');
-    writeAccountStorageState(profile, storageState);
+    await persistAccountStorageState(profile, storageState, { source: 'manual_upload' });
     return res.json({ ok: true, profile });
   } catch (err) {
     return res.status(400).json({ ok: false, error: err.message || 'invalid payload' });
   }
 });
 
-app.delete('/v1/admin/accounts/:profile', requireAdmin, (req, res) => {
+app.delete('/v1/admin/accounts/:profile', requireAdmin, async (req, res) => {
   let profile;
   try {
     profile = sanitizeProfileName(req.params.profile);
@@ -3509,13 +4805,15 @@ app.delete('/v1/admin/accounts/:profile', requireAdmin, (req, res) => {
   try {
     const fp = accountFilePath(profile);
     if (fs.existsSync(fp)) fs.unlinkSync(fp);
-    taskSystem.deleteMirroredAccount(profile).catch((err) => {
-      const msg = err && err.message ? String(err.message) : String(err);
-      console.warn(`⚠️ MySQL mirrored account delete failed for ${profile}: ${msg}`);
-    });
+    if (taskSystem.deleteMirroredAccount) {
+      const result = await taskSystem.deleteMirroredAccount(profile);
+      if (result && result.ok === false) {
+        throw new Error(result.reason || 'mysql delete failed');
+      }
+    }
     return res.json({ ok: true, profile });
-  } catch {
-    return res.status(500).json({ ok: false, error: 'delete failed' });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message || 'delete failed' });
   }
 });
 
@@ -4007,6 +5305,16 @@ function startServer({ port = PORT, host = HOST } = {}) {
         } else {
           console.log('🧪 pool auto-check: disabled (set PROXY_POOL_AUTOCHECK=1 to enable)');
         }
+
+        if (isPoolFlowAutoCheckEnabled()) {
+          startPoolFlowAutoCheckLoop(server);
+          const cfg = getPoolFlowAutoCheckDefaults();
+          console.log(
+            `🧪 pool flow precheck: enabled (every ${Math.round(cfg.intervalMs / 1000)}s, max ${cfg.maxItems}/tick, disableOnFail=${cfg.disableOnFail ? '1' : '0'})`,
+          );
+        } else {
+          console.log('🧪 pool flow precheck: disabled (set PROXY_POOL_FLOW_AUTOCHECK=1 to enable)');
+        }
         resolve({ app, server, host, port: actualPort, baseUrl, lanUrls });
       });
     });
@@ -4016,6 +5324,7 @@ function startServer({ port = PORT, host = HOST } = {}) {
 function getBootstrapInfo() {
   return {
     envLoadedFrom: ENV_LOADED_FROM,
+    envLoadedFiles: ENV_LOADED_FILES,
     envHint: configEnvHintPath(),
     adminPasswordSource: ADMIN_PASSWORD_SOURCE,
     // Only for Electron main process usage; do NOT expose this in HTTP endpoints.

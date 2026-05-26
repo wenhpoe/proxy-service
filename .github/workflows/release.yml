@@ -48,9 +48,16 @@ jobs:
       - name: Write .env (optional, for bundled admin auth)
         shell: bash
         env:
+          PROXY_BUNDLED_ENV_BASE64: ${{ secrets.PROXY_BUNDLED_ENV_BASE64 }}
           PROXY_ADMIN_PASSWORD: ${{ secrets.PROXY_ADMIN_PASSWORD }}
           PROXY_ADMIN_SESSION_SECRET: ${{ secrets.PROXY_ADMIN_SESSION_SECRET }}
         run: |
+          if [ -n "${PROXY_BUNDLED_ENV_BASE64}" ]; then
+            echo "${PROXY_BUNDLED_ENV_BASE64}" | base64 --decode > .env
+            echo "✅ wrote .env from PROXY_BUNDLED_ENV_BASE64"
+            exit 0
+          fi
+
           BUNDLED_PASSWORD="${PROXY_ADMIN_PASSWORD:-123456}"
           SESSION_SECRET="${PROXY_ADMIN_SESSION_SECRET}"
           if [ -z "${SESSION_SECRET}" ]; then

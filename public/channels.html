@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>渠道配置 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script defer src="/nav.js"></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>渠道配置</h1>
+          <div class="sub">管理客户端可见渠道、默认 Provider、常用参数与执行端路由映射。</div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnAddChannel">新增渠道</button>
+          <button class="btn primary" id="btnSave">保存</button>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid">
+        <section class="card" style="grid-column:1 / -1">
+          <div class="card-h">
+            <h2>配置说明</h2>
+            <span class="badge mono">channels[].selected_provider</span>
+          </div>
+          <div class="card-b">
+            <div class="kvmini" style="grid-template-columns: 120px 1fr; gap: 8px 14px;">
+              <div class="k">渠道</div>
+              <div class="v">例如 <span class="mono">flow</span>、<span class="mono">seedance</span>，表示一类生成能力。</div>
+              <div class="k">Provider</div>
+              <div class="v">同一渠道可接多个服务商，客户端默认走 <span class="mono">selected_provider</span>。</div>
+              <div class="k">默认参数</div>
+              <div class="v">常用字段可视化填写，高级参数继续保留 JSON 扩展能力。</div>
+            </div>
+            <div class="status" id="status" role="status" aria-live="polite" hidden></div>
+          </div>
+        </section>
+
+        <section class="card" style="grid-column:1 / -1">
+          <div class="card-h">
+            <h2>渠道列表</h2>
+            <div class="actions">
+              <span class="badge" id="channelCount">0 个渠道</span>
+            </div>
+          </div>
+          <div class="card-b">
+            <div id="channelList" class="stack"></div>
+          </div>
+        </section>
+
+        <section class="card" style="grid-column:1 / -1">
+          <div class="card-h">
+            <h2>预览 JSON</h2>
+            <div class="actions">
+              <button class="btn sm" id="btnTogglePreview" type="button">折叠</button>
+            </div>
+          </div>
+          <div class="card-b" id="previewWrap">
+            <textarea id="configPreview" class="mono" style="min-height:320px" readonly></textarea>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <template id="channelTpl">
+      <section class="card channel-card">
+        <div class="card-h">
+          <div class="stack" style="gap:4px; min-width:0; flex:1;">
+            <div class="row" style="justify-content:space-between; align-items:flex-start;">
+              <div class="stack" style="gap:6px; min-width:0; flex:1;">
+                <label class="section-label">渠道名称</label>
+                <div class="row">
+                  <input class="input channel-key" placeholder="key，如 seedance" style="max-width:220px" />
+                  <input class="input channel-label" placeholder="显示名称，如 Seedance" style="max-width:240px" />
+                </div>
+              </div>
+              <div class="actions">
+                <label class="switch" title="启用渠道">
+                  <input type="checkbox" class="hidden channel-enabled" />
+                  <span class="sw"></span>
+                </label>
+                <button class="btn sm danger btn-remove-channel" type="button">删除渠道</button>
+              </div>
+            </div>
+            <div class="meta">渠道 Key 会同步给客户端与执行端，请保持稳定且唯一。</div>
+            <div class="inline-badges channel-summary"></div>
+          </div>
+        </div>
+        <div class="card-b stack" style="gap:14px;">
+          <div class="row">
+            <div class="stack" style="flex:1; min-width:220px;">
+              <label class="section-label">默认 Provider</label>
+              <select class="sm channel-selected-provider"></select>
+            </div>
+            <div class="stack" style="flex:1; min-width:220px;">
+              <label class="section-label">优先级</label>
+              <input type="number" class="input sm channel-priority" placeholder="100" />
+            </div>
+          </div>
+
+          <div class="stack" style="gap:10px;">
+            <div class="row" style="justify-content:space-between; align-items:center;">
+              <div>
+                <div class="section-label">能力开关</div>
+                <div class="meta">控制客户端与执行端如何理解这个渠道。</div>
+              </div>
+            </div>
+            <div class="inline-badges capabilities-row"></div>
+          </div>
+
+          <div class="stack" style="gap:10px;">
+            <div class="section-label">约束</div>
+            <div class="inline-badges constraints-row"></div>
+          </div>
+
+          <div class="stack" style="gap:10px;">
+            <div class="section-label">默认参数</div>
+            <div class="row default-param-grid">
+              <input class="input sm dp-model-name" placeholder="默认模型名 / model_name" style="min-width:220px; flex:1" />
+              <input class="input sm dp-model" placeholder="默认 model（如 seedance model）" style="min-width:220px; flex:1" />
+              <input class="input sm dp-aspect-ratio" placeholder="默认 aspect_ratio" style="min-width:180px; flex:1" />
+              <input class="input sm dp-size" placeholder="默认 size（如 9:16）" style="min-width:180px; flex:1" />
+              <input type="number" class="input sm dp-seconds" placeholder="默认 seconds" style="min-width:160px; flex:1" />
+            </div>
+            <div class="meta">常用默认参数走可视化表单；仍可在下方 JSON 扩展高级字段。</div>
+            <textarea class="channel-default-params" placeholder='高级补充 JSON，例如：{"params":{"channel_options":{"human_speed_preset":"fast"}}}'></textarea>
+          </div>
+
+          <div class="stack" style="gap:10px;">
+            <div class="row" style="justify-content:space-between; align-items:center;">
+              <div>
+                <div class="section-label">Provider 列表</div>
+                <div class="meta">同一个渠道可配置多个服务商，客户端默认走当前选中的服务商。</div>
+              </div>
+              <button class="btn sm btn-add-provider" type="button">新增 Provider</button>
+            </div>
+            <div class="provider-list stack"></div>
+          </div>
+        </div>
+      </section>
+    </template>
+
+    <template id="providerTpl">
+      <section class="card provider-card">
+        <div class="card-b stack" style="gap:10px;">
+          <div class="row" style="justify-content:space-between; align-items:flex-start;">
+            <div class="row" style="flex:1; min-width:0;">
+              <input class="input sm provider-key" placeholder="provider key，如 1" style="max-width:120px" />
+              <input class="input sm provider-label" placeholder="显示名称，如 服务商 1" style="max-width:220px" />
+              <input class="input sm provider-runner-key" placeholder="runner_key，如 seedance.provider1" style="min-width:240px; flex:1" />
+            </div>
+            <div class="actions">
+              <label class="switch" title="启用 Provider">
+                <input type="checkbox" class="hidden provider-enabled" />
+                <span class="sw"></span>
+              </label>
+              <button class="btn sm danger btn-remove-provider" type="button">删除</button>
+            </div>
+          </div>
+          <div class="row">
+            <input class="input sm provider-base-url" placeholder="base_url，如 https://testapi.genvia.ai" style="flex:1; min-width:260px" />
+            <input class="input sm provider-model" placeholder="model（可选）" style="flex:1; min-width:220px" />
+          </div>
+        </div>
+      </section>
+    </template>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const state = {
+        config: { version: 1, channels: [] },
+        previewOpen: true,
+      };
+
+      const CAPABILITY_FIELDS = [
+        ['text_to_image', '文生图'],
+        ['image_to_image', '图生图'],
+        ['upsample', '放大/增强'],
+        ['download', '下载结果'],
+      ];
+
+      const CONSTRAINT_FIELDS = [
+        ['requires_image', '需要参考图'],
+      ];
+
+      function setStatus(kind, text) {
+        const el = $('status');
+        el.hidden = false;
+        el.className = `status ${kind}`;
+        el.textContent = text;
+      }
+
+      async function j(url, init = {}) {
+        const res = await fetch(url, {
+          ...init,
+          headers: {
+            accept: 'application/json',
+            ...(init.headers || {}),
+          },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data?.ok === false) throw new Error(data?.error || `请求失败（HTTP ${res.status}）`);
+        return data;
+      }
+
+      function deepClone(value) {
+        return JSON.parse(JSON.stringify(value));
+      }
+
+      function safeJsonParse(text, fallback) {
+        const raw = String(text || '').trim();
+        if (!raw) return deepClone(fallback);
+        try {
+          const parsed = JSON.parse(raw);
+          return parsed && typeof parsed === 'object' ? parsed : deepClone(fallback);
+        } catch {
+          throw new Error('JSON 格式不正确');
+        }
+      }
+
+      function normalizeFromForm() {
+        const channels = Array.from(document.querySelectorAll('.channel-card')).map((card) => {
+          const capabilities = {};
+          CAPABILITY_FIELDS.forEach(([key]) => {
+            capabilities[key] = !!card.querySelector(`.cap-${key}`)?.checked;
+          });
+
+          const constraints = {};
+          CONSTRAINT_FIELDS.forEach(([key]) => {
+            const checked = !!card.querySelector(`.constraint-${key}`)?.checked;
+            if (checked) constraints[key] = true;
+          });
+
+          const providers = Array.from(card.querySelectorAll('.provider-card')).map((providerCard) => {
+            const provider = {
+              key: String(providerCard.querySelector('.provider-key')?.value || '').trim() || '1',
+              label: String(providerCard.querySelector('.provider-label')?.value || '').trim() || '服务商 1',
+              enabled: !!providerCard.querySelector('.provider-enabled')?.checked,
+            };
+            const runnerKey = String(providerCard.querySelector('.provider-runner-key')?.value || '').trim();
+            const baseUrl = String(providerCard.querySelector('.provider-base-url')?.value || '').trim();
+            const model = String(providerCard.querySelector('.provider-model')?.value || '').trim();
+            if (runnerKey) provider.runner_key = runnerKey;
+            if (baseUrl) provider.base_url = baseUrl;
+            if (model) provider.model = model;
+            return provider;
+          });
+
+          const visualDefaultParams = buildVisualDefaultParams(card);
+          const extraDefaultParams = safeJsonParse(card.querySelector('.channel-default-params')?.value || '', {});
+          const defaultParams = mergeDefaultParams(visualDefaultParams, extraDefaultParams);
+
+          return {
+            key: String(card.querySelector('.channel-key')?.value || '').trim() || 'channel',
+            label: String(card.querySelector('.channel-label')?.value || '').trim() || '渠道',
+            enabled: !!card.querySelector('.channel-enabled')?.checked,
+            selected_provider: String(card.querySelector('.channel-selected-provider')?.value || '').trim() || (providers[0]?.key || '1'),
+            priority: Number(card.querySelector('.channel-priority')?.value || 0) || 0,
+            capabilities,
+            constraints,
+            default_params: defaultParams,
+            providers,
+          };
+        });
+
+        state.config = {
+          version: Number(state.config?.version || 1) || 1,
+          channels,
+        };
+        renderPreview();
+        return state.config;
+      }
+
+      function renderPreview() {
+        $('configPreview').value = JSON.stringify(state.config || {}, null, 2);
+        $('channelCount').textContent = `${state.config?.channels?.length || 0} 个渠道`;
+      }
+
+      function renderChannelSummary(card) {
+        const host = card.querySelector('.channel-summary');
+        if (!host) return;
+        const key = String(card.querySelector('.channel-key')?.value || '').trim() || 'channel';
+        const selectedProvider = String(card.querySelector('.channel-selected-provider')?.value || '').trim() || '1';
+        const enabled = !!card.querySelector('.channel-enabled')?.checked;
+        const providerCount = card.querySelectorAll('.provider-card').length;
+        host.innerHTML = [
+          `<span class="badge mono ${enabled ? 'good' : 'warn'}">${enabled ? 'enabled' : 'disabled'}</span>`,
+          `<span class="badge mono">key: ${key}</span>`,
+          `<span class="badge mono">provider: ${selectedProvider}</span>`,
+          `<span class="badge mono">providers: ${providerCount}</span>`,
+        ].join('');
+      }
+
+      function mergeDefaultParams(base, extra) {
+        const out = deepClone(base || {});
+        const src = extra && typeof extra === 'object' ? extra : {};
+        for (const [key, value] of Object.entries(src)) {
+          if (
+            value && typeof value === 'object' && !Array.isArray(value) &&
+            out[key] && typeof out[key] === 'object' && !Array.isArray(out[key])
+          ) {
+            out[key] = mergeDefaultParams(out[key], value);
+          } else {
+            out[key] = value;
+          }
+        }
+        return out;
+      }
+
+      function buildVisualDefaultParams(card) {
+        const modelName = String(card.querySelector('.dp-model-name')?.value || '').trim();
+        const model = String(card.querySelector('.dp-model')?.value || '').trim();
+        const aspectRatio = String(card.querySelector('.dp-aspect-ratio')?.value || '').trim();
+        const size = String(card.querySelector('.dp-size')?.value || '').trim();
+        const secondsRaw = String(card.querySelector('.dp-seconds')?.value || '').trim();
+        const seconds = Number(secondsRaw);
+        const params = {};
+        const channelOptions = {};
+        if (modelName) channelOptions.model_name = modelName;
+        if (aspectRatio) channelOptions.aspect_ratio = aspectRatio;
+        if (Object.keys(channelOptions).length) params.channel_options = channelOptions;
+        if (model) params.model = model;
+        if (size) params.size = size;
+        if (Number.isFinite(seconds) && seconds > 0) params.seconds = seconds;
+        return Object.keys(params).length ? { params } : {};
+      }
+
+      function hydrateVisualDefaultParams(card, defaultParams) {
+        const params = defaultParams && typeof defaultParams === 'object' ? (defaultParams.params || {}) : {};
+        const channelOptions = params && typeof params === 'object' ? (params.channel_options || {}) : {};
+        card.querySelector('.dp-model-name').value = channelOptions.model_name || '';
+        card.querySelector('.dp-model').value = params.model || '';
+        card.querySelector('.dp-aspect-ratio').value = channelOptions.aspect_ratio || '';
+        card.querySelector('.dp-size').value = params.size || '';
+        card.querySelector('.dp-seconds').value = params.seconds || '';
+      }
+
+      function sanitizeExtraDefaultParams(defaultParams) {
+        const value = deepClone(defaultParams || {});
+        if (value.params && typeof value.params === 'object') {
+          if (Object.prototype.hasOwnProperty.call(value.params, 'model')) delete value.params.model;
+          if (Object.prototype.hasOwnProperty.call(value.params, 'size')) delete value.params.size;
+          if (Object.prototype.hasOwnProperty.call(value.params, 'seconds')) delete value.params.seconds;
+          if (value.params.channel_options && typeof value.params.channel_options === 'object') {
+            delete value.params.channel_options.model_name;
+            delete value.params.channel_options.aspect_ratio;
+            if (!Object.keys(value.params.channel_options).length) delete value.params.channel_options;
+          }
+          if (!Object.keys(value.params).length) delete value.params;
+        }
+        return value;
+      }
+
+      function bindProviderEvents(providerCard, channelCard) {
+        providerCard.querySelector('.btn-remove-provider')?.addEventListener('click', () => {
+          providerCard.remove();
+          refreshProviderSelect(channelCard);
+          normalizeFromForm();
+        });
+        providerCard.querySelectorAll('input').forEach((input) => {
+          input.addEventListener('input', () => {
+            refreshProviderSelect(channelCard);
+            normalizeFromForm();
+          });
+          input.addEventListener('change', () => {
+            refreshProviderSelect(channelCard);
+            normalizeFromForm();
+          });
+        });
+      }
+
+      function createProviderCard(provider = {}, channelCard) {
+        const node = $('providerTpl').content.firstElementChild.cloneNode(true);
+        node.querySelector('.provider-key').value = provider.key || '1';
+        node.querySelector('.provider-label').value = provider.label || '服务商 1';
+        node.querySelector('.provider-runner-key').value = provider.runner_key || '';
+        node.querySelector('.provider-base-url').value = provider.base_url || '';
+        node.querySelector('.provider-model').value = provider.model || '';
+        node.querySelector('.provider-enabled').checked = provider.enabled !== false;
+        bindProviderEvents(node, channelCard);
+        return node;
+      }
+
+      function refreshProviderSelect(channelCard) {
+        const select = channelCard.querySelector('.channel-selected-provider');
+        const previous = select.value;
+        const providers = Array.from(channelCard.querySelectorAll('.provider-card')).map((providerCard) => ({
+          key: String(providerCard.querySelector('.provider-key')?.value || '').trim() || '1',
+          label: String(providerCard.querySelector('.provider-label')?.value || '').trim() || '服务商 1',
+        }));
+        select.innerHTML = providers.map((provider) => `<option value="${provider.key}">${provider.label} (${provider.key})</option>`).join('');
+        select.value = providers.find((provider) => provider.key === previous)?.key || providers[0]?.key || '1';
+        renderChannelSummary(channelCard);
+      }
+
+      function bindChannelEvents(channelCard) {
+        channelCard.querySelector('.btn-remove-channel')?.addEventListener('click', () => {
+          channelCard.remove();
+          normalizeFromForm();
+        });
+        channelCard.querySelector('.btn-add-provider')?.addEventListener('click', () => {
+          const providerList = channelCard.querySelector('.provider-list');
+          providerList.appendChild(createProviderCard({ key: String(providerList.children.length + 1) }, channelCard));
+          refreshProviderSelect(channelCard);
+          normalizeFromForm();
+        });
+        channelCard.querySelectorAll('input, select, textarea').forEach((input) => {
+          input.addEventListener('input', () => {
+            renderChannelSummary(channelCard);
+            normalizeFromForm();
+          });
+          input.addEventListener('change', () => {
+            renderChannelSummary(channelCard);
+            normalizeFromForm();
+          });
+        });
+      }
+
+      function createToggle(key, label, className, checked) {
+        const wrap = document.createElement('label');
+        wrap.className = 'badge';
+        wrap.style.gap = '10px';
+        wrap.innerHTML = `
+          <span>${label}</span>
+          <span class="switch">
+            <input type="checkbox" class="hidden ${className}${key}" ${checked ? 'checked' : ''} />
+            <span class="sw"></span>
+          </span>
+        `;
+        return wrap;
+      }
+
+      function createChannelCard(channel = {}) {
+        const node = $('channelTpl').content.firstElementChild.cloneNode(true);
+        node.querySelector('.channel-key').value = channel.key || '';
+        node.querySelector('.channel-label').value = channel.label || '';
+        node.querySelector('.channel-enabled').checked = channel.enabled !== false;
+        node.querySelector('.channel-priority').value = Number(channel.priority || 0) || '';
+        hydrateVisualDefaultParams(node, channel.default_params || {});
+        node.querySelector('.channel-default-params').value = JSON.stringify(sanitizeExtraDefaultParams(channel.default_params || {}), null, 2);
+
+        const capabilitiesRow = node.querySelector('.capabilities-row');
+        CAPABILITY_FIELDS.forEach(([key, label]) => {
+          capabilitiesRow.appendChild(createToggle(key, label, 'cap-', !!channel.capabilities?.[key]));
+        });
+
+        const constraintsRow = node.querySelector('.constraints-row');
+        CONSTRAINT_FIELDS.forEach(([key, label]) => {
+          constraintsRow.appendChild(createToggle(key, label, 'constraint-', !!channel.constraints?.[key]));
+        });
+
+        const providerList = node.querySelector('.provider-list');
+        const providers = Array.isArray(channel.providers) && channel.providers.length ? channel.providers : [{ key: '1', label: '服务商 1', enabled: true }];
+        providers.forEach((provider) => providerList.appendChild(createProviderCard(provider, node)));
+
+        bindChannelEvents(node);
+        refreshProviderSelect(node);
+        node.querySelector('.channel-selected-provider').value = channel.selected_provider || providers[0]?.key || '1';
+        renderChannelSummary(node);
+        return node;
+      }
+
+      function renderChannels() {
+        const host = $('channelList');
+        host.innerHTML = '';
+        const channels = Array.isArray(state.config?.channels) ? state.config.channels : [];
+        channels.forEach((channel) => host.appendChild(createChannelCard(channel)));
+        renderPreview();
+      }
+
+      async function loadConfig() {
+        const data = await j('/v1/admin/channels');
+        state.config = deepClone(data.config || { version: 1, channels: [] });
+        renderChannels();
+        setStatus('good', `已加载：${data.path || '—'}`);
+      }
+
+      async function saveConfig() {
+        const payload = normalizeFromForm();
+        const data = await j('/v1/admin/channels', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        state.config = deepClone(data.config || payload);
+        renderChannels();
+        setStatus('good', `已保存：${data.path || '—'}`);
+      }
+
+      $('btnRefresh').addEventListener('click', () => loadConfig().catch((err) => setStatus('bad', err.message || '加载失败')));
+      $('btnSave').addEventListener('click', () => saveConfig().catch((err) => setStatus('bad', err.message || '保存失败')));
+      $('btnAddChannel').addEventListener('click', () => {
+        $('channelList').appendChild(createChannelCard({ key: `channel_${Date.now()}`, label: '新渠道', enabled: true, providers: [{ key: '1', label: '服务商 1', enabled: true }] }));
+        normalizeFromForm();
+      });
+      $('btnTogglePreview').addEventListener('click', () => {
+        state.previewOpen = !state.previewOpen;
+        $('previewWrap').hidden = !state.previewOpen;
+        $('btnTogglePreview').textContent = state.previewOpen ? '折叠' : '展开';
+      });
+
+      window.refresh = loadConfig;
+      window.addEventListener('load', () => loadConfig().catch((err) => setStatus('bad', err.message || '加载失败')));
+    </script>
+  </body>
+</html>

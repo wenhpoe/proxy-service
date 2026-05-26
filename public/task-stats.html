@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>任务统计 · 代理服务</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/nav.js" defer></script>
+    <script src="/time.js" defer></script>
+    <style>
+      .stat-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .stat-card {
+        border: 1px solid rgba(23, 29, 26, 0.1);
+        border-radius: 16px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.58);
+      }
+      .stat-label {
+        color: var(--ink2);
+        font-size: 12px;
+      }
+      .stat-value {
+        margin-top: 6px;
+        font-family: var(--mono);
+        font-size: 26px;
+        font-weight: 760;
+        color: var(--ink);
+      }
+      .stat-sub {
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      @media (max-width: 960px) {
+        .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (max-width: 560px) {
+        .stat-grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="topbar">
+        <div class="brand">
+          <h1>任务统计</h1>
+          <div class="sub">按提交机器、执行机器、渠道和状态聚合共享任务；当前阶段统计任务量、run 数和输出数。</div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnLogout">退出</button>
+          <div class="pill" title="服务状态">
+            <span class="led" id="led"></span>
+            <span class="mono" id="pillText">检查中…</span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="nav" aria-label="导航" data-nav></nav>
+
+      <main class="grid single">
+        <section class="card" aria-label="筛选">
+          <div class="card-h">
+            <h2>筛选</h2>
+            <div class="row">
+              <input class="input" id="machineId" placeholder="machineId（提交或执行）" style="width: 260px" />
+              <select id="days" style="width: 140px">
+                <option value="1">最近 1 天</option>
+                <option value="7">最近 7 天</option>
+                <option value="30" selected>最近 30 天</option>
+                <option value="90">最近 90 天</option>
+                <option value="365">最近 365 天</option>
+              </select>
+            </div>
+          </div>
+          <div class="card-b">
+            <div class="status" id="status" hidden></div>
+            <div class="stat-grid" id="summaryGrid"></div>
+            <div class="hint" id="usageHint" style="margin-top: 12px"></div>
+          </div>
+        </section>
+
+        <section class="card" aria-label="提交机器排行">
+          <div class="card-h"><h2>按提交机器</h2><span class="hint">created_by_machine_id</span></div>
+          <div class="card-b"><div class="tablebox"><table><thead id="submitterHead"></thead><tbody id="submitterRows"></tbody></table></div></div>
+        </section>
+
+        <section class="card" aria-label="执行机器排行">
+          <div class="card-h"><h2>按执行机器</h2><span class="hint">target_machine_id</span></div>
+          <div class="card-b"><div class="tablebox"><table><thead id="executorHead"></thead><tbody id="executorRows"></tbody></table></div></div>
+        </section>
+
+        <section class="card" aria-label="渠道分布">
+          <div class="card-h"><h2>按渠道 / 类型</h2><span class="hint">channel.provider/task_type</span></div>
+          <div class="card-b"><div class="tablebox"><table><thead id="channelHead"></thead><tbody id="channelRows"></tbody></table></div></div>
+        </section>
+
+        <section class="card" aria-label="状态分布">
+          <div class="card-h"><h2>按状态</h2><span class="hint">status</span></div>
+          <div class="card-b"><div class="tablebox"><table><thead id="statusHead"></thead><tbody id="statusRows"></tbody></table></div></div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const state = { stats: null };
+
+      function esc(value) {
+        return String(value == null ? '' : value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;');
+      }
+
+      function n(value) {
+        return Number(value || 0).toLocaleString('zh-CN');
+      }
+
+      function ts(value) {
+        if (!value) return '—';
+        const d = new Date(value);
+        if (Number.isNaN(d.getTime())) return String(value);
+        return d.toLocaleString('zh-CN', { hour12: false });
+      }
+
+      function setStatus(kind, text, { autoHideMs = 2800 } = {}) {
+        const el = $('status');
+        el.hidden = false;
+        el.className = `status ${kind === 'ok' ? 'good' : kind === 'err' ? 'bad' : 'warn'}`;
+        el.textContent = text;
+        if (autoHideMs) setTimeout(() => { el.hidden = true; }, autoHideMs);
+      }
+
+      function pill(kind, text) {
+        $('led').className = `led ${kind === 'ok' ? 'on' : kind === 'err' ? 'bad' : ''}`;
+        $('pillText').textContent = text;
+      }
+
+      async function j(url, opts = {}) {
+        const res = await fetch(url, { headers: { accept: 'application/json' }, ...opts });
+        if (res.status === 401) {
+          const next = encodeURIComponent(location.pathname + location.search);
+          location.href = `/login.html?next=${next}`;
+          throw new Error('未登录');
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
+        return data;
+      }
+
+      function statCard(label, value, sub = '') {
+        return `<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(value)}</div><div class="stat-sub">${esc(sub)}</div></div>`;
+      }
+
+      function renderSummary() {
+        const s = state.stats?.summary || {};
+        $('summaryGrid').innerHTML = [
+          statCard('任务总数', n(s.totalTasks), `run ${n(s.totalRuns)} · 输出 ${n(s.outputCount)}`),
+          statCard('成功任务', n(s.succeededTasks), `失败 ${n(s.failedTasks)} · 取消/过期 ${n(s.cancelledTasks)}`),
+          statCard('运行中', n(s.runningTasks), `排队 ${n(s.queuedTasks)}`),
+          statCard('统计范围', `${$('days').value} 天`, `最近更新 ${ts(s.lastUpdatedAt)}`),
+        ].join('');
+        const usage = state.stats?.usage || {};
+        $('usageHint').textContent = usage.available ? '' : (usage.note || '用量字段尚未接入。');
+      }
+
+      const tableHead = `
+        <tr>
+          <th>维度</th><th>任务</th><th>成功</th><th>运行</th><th>排队</th><th>失败</th><th>取消/过期</th><th>run</th><th>输出</th><th>最近更新</th>
+        </tr>`;
+
+      function renderTable(headId, bodyId, rows) {
+        $(headId).innerHTML = tableHead;
+        const list = Array.isArray(rows) ? rows : [];
+        if (!list.length) {
+          $(bodyId).innerHTML = `<tr><td colspan="10"><div class="hint">暂无数据</div></td></tr>`;
+          return;
+        }
+        $(bodyId).innerHTML = list.map((row) => `
+          <tr>
+            <td class="mono">${esc(row.key || '—')}</td>
+            <td>${n(row.totalTasks)}</td>
+            <td>${n(row.succeededTasks)}</td>
+            <td>${n(row.runningTasks)}</td>
+            <td>${n(row.queuedTasks)}</td>
+            <td>${n(row.failedTasks)}</td>
+            <td>${n(row.cancelledTasks)}</td>
+            <td>${n(row.totalRuns)}</td>
+            <td>${n(row.outputCount)}</td>
+            <td>${esc(ts(row.lastUpdatedAt))}</td>
+          </tr>
+        `).join('');
+      }
+
+      function renderAll() {
+        renderSummary();
+        renderTable('submitterHead', 'submitterRows', state.stats?.bySubmitter);
+        renderTable('executorHead', 'executorRows', state.stats?.byExecutor);
+        renderTable('channelHead', 'channelRows', state.stats?.byChannel);
+        renderTable('statusHead', 'statusRows', state.stats?.byStatus);
+      }
+
+      function filters() {
+        const params = new URLSearchParams();
+        const machineId = $('machineId').value.trim();
+        if (machineId) params.set('machineId', machineId);
+        params.set('days', $('days').value || '30');
+        return params.toString();
+      }
+
+      async function refreshAll({ silent = false } = {}) {
+        if (!silent) setStatus('warn', '刷新中…', { autoHideMs: 0 });
+        try {
+          const data = await j(`/v1/admin/task-stats?${filters()}`);
+          state.stats = data.stats || null;
+          renderAll();
+          pill('ok', '统计在线');
+          if (!silent) setStatus('ok', '统计已刷新');
+        } catch (err) {
+          pill('err', '统计异常');
+          if (!silent) setStatus('err', err.message || '刷新失败', { autoHideMs: 8000 });
+        }
+      }
+
+      $('btnRefresh').addEventListener('click', () => refreshAll());
+      $('btnLogout').addEventListener('click', async () => {
+        try { await fetch('/auth/logout', { method: 'POST' }); } finally { location.href = '/login.html'; }
+      });
+      $('days').addEventListener('change', () => refreshAll({ silent: true }));
+      $('machineId').addEventListener('change', () => refreshAll({ silent: true }));
+      $('machineId').addEventListener('keydown', (e) => { if (e.key === 'Enter') refreshAll(); });
+      window.refreshAll = refreshAll;
+      window.addEventListener('pageshow', () => refreshAll({ silent: true }));
+      refreshAll();
+    </script>
+  </body>
+</html>

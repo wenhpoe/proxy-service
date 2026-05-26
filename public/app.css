@@ -715,6 +715,72 @@ input[type="checkbox"].hidden:checked + .sw::after {
   line-height: 1.45;
 }
 
+.inline-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.section-label {
+  margin: 0 0 6px;
+  color: var(--ink3);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.code-line {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(22, 32, 27, 0.05);
+  color: var(--ink2);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+.task-deep,
+.task-tree {
+  margin-top: 8px;
+  padding: 8px 10px;
+}
+
+.task-deep-body,
+.task-node-group {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.task-node {
+  border: 1px solid rgba(23, 29, 26, 0.1);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.66);
+}
+
+.task-node.empty {
+  color: var(--ink3);
+}
+
+.task-node-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.task-node-meta {
+  margin-top: 6px;
+  color: var(--ink3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 details {
   border: 1px solid rgba(23, 29, 26, 0.1);
   border-radius: 14px;

@@ -82,6 +82,7 @@
             <div style="height: 12px"></div>
             <div class="row">
               <span class="chip"><span class="mono">存储</span> <strong id="storePath">—</strong></span>
+              <span class="chip"><span class="mono">MySQL</span> <strong id="mysqlStatus">—</strong></span>
               <span class="chip"><span class="mono">总数</span> <strong id="poolCount">0</strong></span>
               <span class="chip"><span class="mono">启用</span> <strong id="poolEnabled">0</strong></span>
             </div>
@@ -125,6 +126,7 @@
                   <button class="btn" id="btnBulkDisable" title="禁用勾选条目">禁用</button>
                   <button class="btn danger" id="btnBulkDelete" title="删除勾选条目">删除</button>
                   <button class="btn" id="btnCheckAll" title="按当前筛选逐个检测">一键检测</button>
+                  <button class="btn primary" id="btnFlowCheckAll" title="按当前筛选逐个执行 Flow 预检">Flow 预检</button>
                   <button class="btn danger" id="btnPurgeDisabled" title="删除所有禁用项">清理禁用</button>
                 </div>
               </div>
@@ -201,6 +203,14 @@
         } catch {
           return String(s || "—");
         }
+      }
+
+      function flowTag(it) {
+        const status = String(it?.flowCheckStatus || "").trim().toLowerCase();
+        if (status === "ok") return "Flow 可用";
+        if (status === "fail") return "Flow 不可用";
+        if (status === "mixed") return "Flow 波动";
+        return "Flow 未检";
       }
 
       function maskCred(server, proxy) {
@@ -293,6 +303,7 @@
         items: [],
         onlyEnabled: false,
         storePath: "—",
+        mysqlStatus: "—",
       };
 
       let pager = null;
@@ -529,6 +540,7 @@
             const protocol = n.protocol || "node";
             const checkType = it.lastCheckType ? String(it.lastCheckType).toUpperCase() : "—";
             const checkDetail = it.lastCheckDetail || it.lastCheckError || "—";
+            const flowDetail = it.flowCheckDetail || it.flowCheckError || "—";
             tr.innerHTML = `
               <td>
                 <label class="check" title="勾选用于批量操作">
@@ -567,6 +579,11 @@
                       <span class="mono" style="margin-left:10px">耗时</span> ${esc(checkMs)}
                       <span class="mono" style="margin-left:10px">详情</span> ${esc(checkDetail)}
                     </div>
+                    <div class="meta">
+                      <span class="mono">Flow</span> ${esc(flowTag(it))}
+                      <span class="mono" style="margin-left:10px">到期</span> ${esc(ts(it.flowCheckExpireAt))}
+                      <span class="mono" style="margin-left:10px">详情</span> ${esc(flowDetail)}
+                    </div>
                   </div>
                 </div>
               </td>
@@ -578,6 +595,7 @@
               <td>
                 <div class="row">
                   <button class="btn sm" data-check="${esc(it.id)}">检测</button>
+                  <button class="btn sm primary" data-flow-check="${esc(it.id)}">Flow 预检</button>
                   <button class="btn sm" data-copy="${esc(n.fullLink || "")}">复制链接</button>
                   <button class="btn sm danger" data-del="${esc(it.id)}">删除</button>
                 </div>
@@ -592,6 +610,7 @@
                 : it.lastCheckError
                   ? String(it.lastCheckError)
                   : "—";
+            const flowDetail = it.flowCheckDetail || it.flowCheckError || "—";
             tr.innerHTML = `
               <td>
                 <label class="check" title="勾选用于批量操作">
@@ -622,6 +641,11 @@
                   <span class="mono" style="margin-left:10px">耗时</span> ${esc(checkMs)}
                   <span class="mono" style="margin-left:10px">状态</span> ${esc(checkDetail)}
                 </div>
+                <div class="meta">
+                  <span class="mono">Flow</span> ${esc(flowTag(it))}
+                  <span class="mono" style="margin-left:10px">到期</span> ${esc(ts(it.flowCheckExpireAt))}
+                  <span class="mono" style="margin-left:10px">详情</span> ${esc(flowDetail)}
+                </div>
               </td>
               <td>
                 <input class="input" data-label="${esc(
@@ -631,6 +655,7 @@
               <td>
                 <div class="row">
                   <button class="btn sm" data-check="${esc(it.id)}">检测</button>
+                  <button class="btn sm primary" data-flow-check="${esc(it.id)}">Flow 预检</button>
                   <button class="btn sm" data-copy="${esc(server)}">复制</button>
                   <button class="btn sm danger" data-del="${esc(it.id)}">删除</button>
                 </div>
@@ -672,6 +697,14 @@
 
           state.storePath = store.storePath || "—";
           $("storePath").textContent = state.storePath;
+
+          const mysqlInfo = store && store.mysql && typeof store.mysql === "object" ? store.mysql : null;
+          const mysqlEnabled = !!(mysqlInfo && mysqlInfo.enabled);
+          const mysqlHasConfig = !!(mysqlInfo && mysqlInfo.hasConfig);
+          const mysqlText = mysqlEnabled ? "已连接" : mysqlHasConfig ? "连接中" : "未启用";
+          state.mysqlStatus = mysqlText;
+          const mysqlEl = $("mysqlStatus");
+          if (mysqlEl) mysqlEl.textContent = mysqlText;
 
             if (!checkInited) {
               checkInited = true;
@@ -800,6 +833,31 @@
         }
       }
 
+      async function checkFlow(id, { silent = false } = {}) {
+        const url = String($("checkUrl").value || "").trim();
+        try {
+          if (!silent) setStatus("warn", "正在执行 Flow 预检…", { autoHideMs: 0 });
+          const r = await j(`/v1/pool/${encodeURIComponent(id)}/flow-check`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ url }),
+          });
+          upsertItem(r.item);
+          render();
+          if (!silent) {
+            setStatus(
+              r.success ? "good" : "bad",
+              r.success ? `Flow 预检通过：${r.detail || "可用"}` : `Flow 预检失败：${r.detail || r.error || "不可用"}`,
+              { autoHideMs: r.success ? 4500 : 9000 },
+            );
+          }
+          return r;
+        } catch (err) {
+          if (!silent) setStatus("bad", err.message || "Flow 预检失败", { autoHideMs: 9000 });
+          return null;
+        }
+      }
+
       async function setLabel(id, label) {
         await j(`/v1/pool/${encodeURIComponent(id)}`, {
           method: "PUT",
@@ -913,6 +971,82 @@
         }
       }
 
+      let bulkFlowCheckRunning = false;
+      let bulkFlowCheckCancel = false;
+
+      async function checkAllFlow() {
+        const btn = $("btnFlowCheckAll");
+        if (bulkFlowCheckRunning) {
+          bulkFlowCheckCancel = true;
+          btn.disabled = true;
+          setStatus("warn", "正在停止 Flow 预检…", { autoHideMs: 3500 });
+          return;
+        }
+
+        const selected = getSelectedList();
+        const items = selected.length ? selected.map((id) => ({ id })) : getFilteredItems();
+        if (!items.length) {
+          setStatus("warn", "没有可预检项（请调整筛选）", { autoHideMs: 2500 });
+          return;
+        }
+
+        bulkFlowCheckRunning = true;
+        bulkFlowCheckCancel = false;
+        btn.textContent = "停止 Flow 预检";
+        try {
+          const total = items.length;
+          const concurrency = Math.min(4, total);
+          let nextIndex = 0;
+          let done = 0;
+          let failed = 0;
+
+          const renderProgress = (curId = "") => {
+            const base = `Flow 预检中：${done}/${total}（并发${concurrency}）`;
+            setStatus("warn", curId ? `${base} · ${curId}` : base, { autoHideMs: 0 });
+          };
+
+          renderProgress();
+
+          const worker = async () => {
+            while (true) {
+              if (bulkFlowCheckCancel) return;
+              const i = nextIndex;
+              if (i >= total) return;
+              nextIndex += 1;
+              const it = items[i];
+              const id = it?.id || "";
+              if (!id) {
+                done += 1;
+                failed += 1;
+                renderProgress();
+                continue;
+              }
+              renderProgress(id);
+              const r = await checkFlow(id, { silent: true });
+              if (!r || !r.success) failed += 1;
+              done += 1;
+              renderProgress();
+            }
+          };
+
+          await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+          if (bulkFlowCheckCancel) {
+            setStatus("warn", `已停止：已完成 ${done}/${total} 项 Flow 预检`, { autoHideMs: 4500 });
+          } else if (failed) {
+            setStatus("warn", `Flow 预检完成：共 ${total} 项（失败 ${failed} 项）`, { autoHideMs: 6500 });
+          } else {
+            setStatus("good", `Flow 预检完成：共 ${total} 项`, { autoHideMs: 4500 });
+          }
+        } finally {
+          bulkFlowCheckRunning = false;
+          bulkFlowCheckCancel = false;
+          btn.disabled = false;
+          btn.textContent = "Flow 预检";
+          await refresh();
+        }
+      }
+
       $("btnRefresh").addEventListener("click", refresh);
       $("btnPick").addEventListener("click", pickRandom);
       $("btnAdd").addEventListener("click", addProxies);
@@ -930,6 +1064,7 @@
       });
       $("btnPurgeDisabled").addEventListener("click", purgeDisabled);
       $("btnCheckAll").addEventListener("click", checkAll);
+      $("btnFlowCheckAll").addEventListener("click", checkAllFlow);
       $("btnBulkEnable").addEventListener("click", () => bulkSetEnabled(true));
       $("btnBulkDisable").addEventListener("click", () => bulkSetEnabled(false));
       $("btnBulkDelete").addEventListener("click", bulkDelete);
@@ -1042,6 +1177,12 @@
         if (chk) {
           const id = chk.getAttribute("data-check");
           await checkProxy(id);
+          return;
+        }
+        const flowChk = e.target.closest("button[data-flow-check]");
+        if (flowChk) {
+          const id = flowChk.getAttribute("data-flow-check");
+          await checkFlow(id);
         }
       });
 

@@ -3,6 +3,8 @@ const crypto = require('crypto');
 const mysql = require('./mysql');
 
 const DEFAULT_WORKER_LIMIT = 7;
+const DEFAULT_ACCOUNT_MAX_CONCURRENCY = DEFAULT_WORKER_LIMIT;
+const MAX_ACCOUNT_MAX_CONCURRENCY = 32;
 const DEFAULT_PRIORITY = 50;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_EXPIRE_SEC = 60 * 60 * 24;
@@ -17,6 +19,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function toMysqlDateTime3(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  const millis = String(date.getMilliseconds()).padStart(3, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${millis}`;
+}
+
 function safeJsonParse(value, fallback) {
   try {
     return JSON.parse(String(value || ''));
@@ -29,6 +45,17 @@ function safeJsonStringify(value) {
   return JSON.stringify(value == null ? null : value);
 }
 
+function normalizeProfileNames(values) {
+  if (!Array.isArray(values)) return [];
+  return Array.from(
+    new Set(
+      values
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => left.localeCompare(right, 'zh-CN'));
+}
+
 function makeId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, '')}`;
 }
@@ -36,6 +63,12 @@ function makeId(prefix) {
 function normalizeStorageRootKey(value) {
   const raw = String(value || '').trim();
   return raw || DEFAULT_STORAGE_ROOT_KEY;
+}
+
+function normalizeAccountMaxConcurrency(value, fallback = DEFAULT_ACCOUNT_MAX_CONCURRENCY) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return Math.max(0, Math.min(MAX_ACCOUNT_MAX_CONCURRENCY, Math.round(fallback)));
+  return Math.max(0, Math.min(MAX_ACCOUNT_MAX_CONCURRENCY, Math.round(n)));
 }
 
 function taskStatusPriority(status) {
@@ -109,6 +142,8 @@ async function ensureSchema() {
         batch_id VARCHAR(64) NOT NULL,
         target_machine_id VARCHAR(191) NOT NULL,
         created_by_machine_id VARCHAR(191) NOT NULL,
+        channel VARCHAR(64) NOT NULL DEFAULT 'flow',
+        provider VARCHAR(64) NOT NULL DEFAULT '1',
         task_type VARCHAR(32) NOT NULL,
         prompt TEXT NOT NULL,
         input_payload_json LONGTEXT NOT NULL,
@@ -137,6 +172,12 @@ async function ensureSchema() {
         KEY idx_tasks_required_account (required_account_profile, status)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+    try {
+      await conn.query(`ALTER TABLE tasks ADD COLUMN channel VARCHAR(64) NOT NULL DEFAULT 'flow'`);
+    } catch {}
+    try {
+      await conn.query(`ALTER TABLE tasks ADD COLUMN provider VARCHAR(64) NOT NULL DEFAULT '1'`);
+    } catch {}
     await conn.query(`
       CREATE TABLE IF NOT EXISTS task_runs (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -254,6 +295,15 @@ async function ensureSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
     await conn.query(`
+      CREATE TABLE IF NOT EXISTS cp_nodes (
+        node_id VARCHAR(191) PRIMARY KEY,
+        enabled TINYINT(1) NOT NULL DEFAULT 1,
+        label VARCHAR(255) NULL,
+        payload_json LONGTEXT NOT NULL,
+        updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+    await conn.query(`
       CREATE TABLE IF NOT EXISTS cp_machines (
         machine_id VARCHAR(191) PRIMARY KEY,
         token_hash VARCHAR(255) NULL,
@@ -288,11 +338,25 @@ async function ensureSchema() {
       CREATE TABLE IF NOT EXISTS cp_accounts (
         profile_name VARCHAR(191) PRIMARY KEY,
         status VARCHAR(32) NOT NULL DEFAULT 'active',
+        max_concurrency INT NOT NULL DEFAULT ${DEFAULT_ACCOUNT_MAX_CONCURRENCY},
         note TEXT NULL,
         updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
         created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+    const [accountConcurrencyCols] = await conn.query(`
+      SELECT COLUMN_NAME
+      FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'cp_accounts'
+        AND COLUMN_NAME = 'max_concurrency'
+      LIMIT 1
+    `);
+    if (!Array.isArray(accountConcurrencyCols) || !accountConcurrencyCols.length) {
+      await conn.query(
+        `ALTER TABLE cp_accounts ADD COLUMN max_concurrency INT NOT NULL DEFAULT ${DEFAULT_ACCOUNT_MAX_CONCURRENCY} AFTER status`,
+      );
+    }
     await conn.query(`
       CREATE TABLE IF NOT EXISTS cp_account_auth_states (
         profile_name VARCHAR(191) PRIMARY KEY,
@@ -336,171 +400,290 @@ async function writeAuditLog({
   );
 }
 
-async function mirrorStoreSnapshot(store) {
-  if (!mysql.isEnabled()) return { ok: false, reason: 'mysql disabled' };
-  await ensureSchema();
-  const snapshot = store && typeof store === 'object' ? store : {};
-  const profiles = snapshot.profiles && typeof snapshot.profiles === 'object' ? snapshot.profiles : {};
-  const pool = Array.isArray(snapshot.pool) ? snapshot.pool : [];
-  const machines = snapshot.machines && typeof snapshot.machines === 'object' ? snapshot.machines : {};
-  const activationCodes = Array.isArray(snapshot.activationCodes) ? snapshot.activationCodes : [];
+async function listMirroredAccountProfileNamesTx(conn) {
+  const [rows] = await conn.execute(
+    `
+      SELECT profile_name
+      FROM cp_accounts
+      ORDER BY profile_name ASC
+    `,
+  );
+  return normalizeProfileNames(
+    (Array.isArray(rows) ? rows : []).map((row) => row?.profile_name),
+  );
+}
 
-  await mysql.transaction(async (conn) => {
-    const profileNames = Object.keys(profiles);
-    if (profileNames.length) {
-      for (const profileName of profileNames) {
-        await conn.execute(
-          `
-            INSERT INTO cp_profiles (profile_name, config_json, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP(3))
-            ON DUPLICATE KEY UPDATE
-              config_json = VALUES(config_json),
-              updated_at = CURRENT_TIMESTAMP(3)
-          `,
-          [profileName, safeJsonStringify(profiles[profileName] || {})],
-        );
-      }
-      const placeholders = profileNames.map(() => '?').join(', ');
+async function loadProfileConfigRowsTx(conn, profileNames) {
+  const names = normalizeProfileNames(profileNames);
+  if (!names.length) return new Map();
+  const placeholders = names.map(() => '?').join(', ');
+  const [rows] = await conn.execute(
+    `
+      SELECT profile_name, config_json
+      FROM cp_profiles
+      WHERE profile_name IN (${placeholders})
+    `,
+    names,
+  );
+  return new Map(
+    (Array.isArray(rows) ? rows : [])
+      .filter((row) => row && row.profile_name)
+      .map((row) => [String(row.profile_name), safeJsonParse(row.config_json, {})]),
+  );
+}
+
+async function ensureProfileRowsTx(conn, profileConfigs, { pruneMissing = true } = {}) {
+  const entries = profileConfigs && typeof profileConfigs === 'object' ? profileConfigs : {};
+  const names = normalizeProfileNames(Object.keys(entries));
+  for (const profileName of names) {
+    await conn.execute(
+      `
+        INSERT INTO cp_profiles (profile_name, config_json, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP(3))
+        ON DUPLICATE KEY UPDATE
+          config_json = VALUES(config_json),
+          updated_at = CURRENT_TIMESTAMP(3)
+      `,
+      [profileName, safeJsonStringify(entries[profileName] || {})],
+    );
+  }
+  if (pruneMissing) {
+    if (names.length) {
+      const placeholders = names.map(() => '?').join(', ');
       await conn.execute(
         `DELETE FROM cp_profiles WHERE profile_name NOT IN (${placeholders})`,
-        profileNames,
+        names,
       );
     } else {
       await conn.execute('DELETE FROM cp_profiles');
     }
+  }
+  return names.length;
+}
 
-    const poolIds = [];
-    for (const item of pool) {
-      if (!item || typeof item !== 'object') continue;
-      const itemId = String(item.id || '').trim();
-      if (!itemId) continue;
-      poolIds.push(itemId);
-      const itemKind = item.node ? 'node' : 'proxy';
-      const enabled = item.enabled === false ? 0 : 1;
-      await conn.execute(
-        `
-          INSERT INTO cp_pool_items (item_id, item_kind, enabled, label, payload_json, updated_at)
-          VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
-          ON DUPLICATE KEY UPDATE
-            item_kind = VALUES(item_kind),
-            enabled = VALUES(enabled),
-            label = VALUES(label),
-            payload_json = VALUES(payload_json),
-            updated_at = CURRENT_TIMESTAMP(3)
-        `,
-        [itemId, itemKind, enabled, item.label ? String(item.label) : null, safeJsonStringify(item)],
-      );
-    }
-    if (poolIds.length) {
-      const placeholders = poolIds.map(() => '?').join(', ');
-      await conn.execute(`DELETE FROM cp_pool_items WHERE item_id NOT IN (${placeholders})`, poolIds);
-    } else {
-      await conn.execute('DELETE FROM cp_pool_items');
-    }
+async function mirrorStoreSnapshotTx(conn, store, { preserveProfileNames = null } = {}) {
+  const snapshot = store && typeof store === 'object' ? store : {};
+  const profiles = snapshot.profiles && typeof snapshot.profiles === 'object' ? snapshot.profiles : {};
+  const pool = Array.isArray(snapshot.pool) ? snapshot.pool : [];
+  const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
+  const machines = snapshot.machines && typeof snapshot.machines === 'object' ? snapshot.machines : {};
+  const activationCodes = Array.isArray(snapshot.activationCodes) ? snapshot.activationCodes : [];
 
-    const machineIds = Object.keys(machines);
-    if (machineIds.length) {
-      for (const machineId of machineIds) {
-        const entry = machines[machineId] && typeof machines[machineId] === 'object' ? machines[machineId] : {};
-        const workerLimit = Number(entry.workerLimit || DEFAULT_WORKER_LIMIT);
-        await conn.execute(
-          `
-            INSERT INTO cp_machines
-            (machine_id, token_hash, activated_at, last_seen_at, reset_at, worker_limit, allowed_profiles_json, note, payload_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
-            ON DUPLICATE KEY UPDATE
-              token_hash = VALUES(token_hash),
-              activated_at = VALUES(activated_at),
-              last_seen_at = VALUES(last_seen_at),
-              reset_at = VALUES(reset_at),
-              worker_limit = VALUES(worker_limit),
-              allowed_profiles_json = VALUES(allowed_profiles_json),
-              note = VALUES(note),
-              payload_json = VALUES(payload_json),
-              updated_at = CURRENT_TIMESTAMP(3)
-          `,
-          [
-            machineId,
-            entry.tokenHash ? String(entry.tokenHash) : null,
-            entry.activatedAt ? String(entry.activatedAt).slice(0, 26).replace('T', ' ') : null,
-            entry.lastSeenAt ? String(entry.lastSeenAt).slice(0, 26).replace('T', ' ') : null,
-            entry.resetAt ? String(entry.resetAt).slice(0, 26).replace('T', ' ') : null,
-            Number.isFinite(workerLimit) && workerLimit > 0 ? Math.round(workerLimit) : DEFAULT_WORKER_LIMIT,
-            safeJsonStringify(Array.isArray(entry.allowedProfiles) ? entry.allowedProfiles : []),
-            entry.note ? String(entry.note) : null,
-            safeJsonStringify(entry),
-          ],
-        );
+  const storedProfileNames = normalizeProfileNames(Object.keys(profiles));
+  const preservedNames = Array.isArray(preserveProfileNames)
+    ? normalizeProfileNames(preserveProfileNames)
+    : await listMirroredAccountProfileNamesTx(conn);
+  const desiredProfileNames = normalizeProfileNames([
+    ...storedProfileNames,
+    ...preservedNames,
+  ]);
+  if (desiredProfileNames.length) {
+    const existingConfigs = await loadProfileConfigRowsTx(conn, desiredProfileNames);
+    const nextProfileConfigs = {};
+    for (const profileName of desiredProfileNames) {
+      if (Object.prototype.hasOwnProperty.call(profiles, profileName)) {
+        nextProfileConfigs[profileName] = profiles[profileName] || {};
+        continue;
       }
-      const placeholders = machineIds.map(() => '?').join(', ');
-      await conn.execute(`DELETE FROM cp_machines WHERE machine_id NOT IN (${placeholders})`, machineIds);
-    } else {
-      await conn.execute('DELETE FROM cp_machines');
+      nextProfileConfigs[profileName] = existingConfigs.get(profileName) || {};
     }
+    await ensureProfileRowsTx(conn, nextProfileConfigs);
+  } else {
+    await ensureProfileRowsTx(conn, {});
+  }
 
-    const codeValues = [];
-    for (const code of activationCodes) {
-      if (!code || typeof code !== 'object') continue;
-      const value = String(code.code || '').trim();
-      if (!value) continue;
-      codeValues.push(value);
+  const poolIds = [];
+  for (const item of pool) {
+    if (!item || typeof item !== 'object') continue;
+    const itemId = String(item.id || '').trim();
+    if (!itemId) continue;
+    poolIds.push(itemId);
+    const itemKind = item.node ? 'node' : 'proxy';
+    const enabled = item.enabled === false ? 0 : 1;
+    await conn.execute(
+      `
+        INSERT INTO cp_pool_items (item_id, item_kind, enabled, label, payload_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
+        ON DUPLICATE KEY UPDATE
+          item_kind = VALUES(item_kind),
+          enabled = VALUES(enabled),
+          label = VALUES(label),
+          payload_json = VALUES(payload_json),
+          updated_at = CURRENT_TIMESTAMP(3)
+      `,
+      [itemId, itemKind, enabled, item.label ? String(item.label) : null, safeJsonStringify(item)],
+    );
+  }
+  if (poolIds.length) {
+    const placeholders = poolIds.map(() => '?').join(', ');
+    await conn.execute(`DELETE FROM cp_pool_items WHERE item_id NOT IN (${placeholders})`, poolIds);
+  } else {
+    await conn.execute('DELETE FROM cp_pool_items');
+  }
+
+  const nodeIds = [];
+  for (const item of nodes) {
+    if (!item || typeof item !== 'object') continue;
+    const nodeId = String(item.id || '').trim();
+    if (!nodeId) continue;
+    nodeIds.push(nodeId);
+    const enabled = item.enabled === false ? 0 : 1;
+    await conn.execute(
+      `
+        INSERT INTO cp_nodes (node_id, enabled, label, payload_json, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3))
+        ON DUPLICATE KEY UPDATE
+          enabled = VALUES(enabled),
+          label = VALUES(label),
+          payload_json = VALUES(payload_json),
+          updated_at = CURRENT_TIMESTAMP(3)
+      `,
+      [nodeId, enabled, item.label ? String(item.label) : null, safeJsonStringify(item)],
+    );
+  }
+  if (nodeIds.length) {
+    const placeholders = nodeIds.map(() => '?').join(', ');
+    await conn.execute(`DELETE FROM cp_nodes WHERE node_id NOT IN (${placeholders})`, nodeIds);
+  } else {
+    await conn.execute('DELETE FROM cp_nodes');
+  }
+
+  const machineIds = Object.keys(machines);
+  if (machineIds.length) {
+    for (const machineId of machineIds) {
+      const entry = machines[machineId] && typeof machines[machineId] === 'object' ? machines[machineId] : {};
+      const workerLimit = Number(entry.workerLimit || DEFAULT_WORKER_LIMIT);
       await conn.execute(
         `
-          INSERT INTO cp_activation_codes (code, payload_json, updated_at)
-          VALUES (?, ?, CURRENT_TIMESTAMP(3))
+          INSERT INTO cp_machines
+          (machine_id, token_hash, activated_at, last_seen_at, reset_at, worker_limit, allowed_profiles_json, note, payload_json, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
           ON DUPLICATE KEY UPDATE
+            token_hash = VALUES(token_hash),
+            activated_at = VALUES(activated_at),
+            last_seen_at = VALUES(last_seen_at),
+            reset_at = VALUES(reset_at),
+            worker_limit = VALUES(worker_limit),
+            allowed_profiles_json = VALUES(allowed_profiles_json),
+            note = VALUES(note),
             payload_json = VALUES(payload_json),
             updated_at = CURRENT_TIMESTAMP(3)
         `,
-        [value, safeJsonStringify(code)],
+        [
+          machineId,
+          entry.tokenHash ? String(entry.tokenHash) : null,
+          toMysqlDateTime3(entry.activatedAt),
+          toMysqlDateTime3(entry.lastSeenAt),
+          toMysqlDateTime3(entry.resetAt),
+          Number.isFinite(workerLimit) && workerLimit > 0 ? Math.round(workerLimit) : DEFAULT_WORKER_LIMIT,
+          safeJsonStringify(Array.isArray(entry.allowedProfiles) ? entry.allowedProfiles : []),
+          entry.note ? String(entry.note) : null,
+          safeJsonStringify(entry),
+        ],
       );
     }
-    if (codeValues.length) {
-      const placeholders = codeValues.map(() => '?').join(', ');
-      await conn.execute(`DELETE FROM cp_activation_codes WHERE code NOT IN (${placeholders})`, codeValues);
-    } else {
-      await conn.execute('DELETE FROM cp_activation_codes');
-    }
-  });
-  return { ok: true };
+    const placeholders = machineIds.map(() => '?').join(', ');
+    await conn.execute(`DELETE FROM cp_machines WHERE machine_id NOT IN (${placeholders})`, machineIds);
+  } else {
+    await conn.execute('DELETE FROM cp_machines');
+  }
+
+  const codeValues = [];
+  for (const code of activationCodes) {
+    if (!code || typeof code !== 'object') continue;
+    const value = String(code.code || '').trim();
+    if (!value) continue;
+    codeValues.push(value);
+    await conn.execute(
+      `
+        INSERT INTO cp_activation_codes (code, payload_json, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP(3))
+        ON DUPLICATE KEY UPDATE
+          payload_json = VALUES(payload_json),
+          updated_at = CURRENT_TIMESTAMP(3)
+      `,
+      [value, safeJsonStringify(code)],
+    );
+  }
+  if (codeValues.length) {
+    const placeholders = codeValues.map(() => '?').join(', ');
+    await conn.execute(`DELETE FROM cp_activation_codes WHERE code NOT IN (${placeholders})`, codeValues);
+  } else {
+    await conn.execute('DELETE FROM cp_activation_codes');
+  }
+
+  return {
+    profiles: desiredProfileNames.length,
+    poolItems: poolIds.length,
+    nodes: nodeIds.length,
+    machines: machineIds.length,
+    activationCodes: codeValues.length,
+  };
+}
+
+async function mirrorStoreSnapshot(store) {
+  if (!mysql.isEnabled()) return { ok: false, reason: 'mysql disabled' };
+  await ensureSchema();
+  const summary = await mysql.transaction(async (conn) => mirrorStoreSnapshotTx(conn, store));
+  return { ok: true, summary };
+}
+
+async function upsertAccountStorageStateTx(conn, profileName, storageState, { source = 'capture' } = {}) {
+  const profile = String(profileName || '').trim();
+  if (!profile) throw new Error('profile required');
+  const payload = storageState && typeof storageState === 'object' ? storageState : {};
+  const payloadJson = safeJsonStringify(payload);
+  await conn.execute(
+    `
+      INSERT INTO cp_accounts (profile_name, status, max_concurrency, created_at, updated_at)
+      VALUES (?, 'active', ?, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))
+      ON DUPLICATE KEY UPDATE
+        updated_at = CURRENT_TIMESTAMP(3)
+    `,
+    [profile, DEFAULT_ACCOUNT_MAX_CONCURRENCY],
+  );
+  const [rows] = await conn.execute(
+    `SELECT storage_state_json, version FROM cp_account_auth_states WHERE profile_name = ? LIMIT 1`,
+    [profile],
+  );
+  const currentRow = Array.isArray(rows) && rows[0] ? rows[0] : null;
+  const currentVersion = currentRow ? Number(currentRow.version || 0) : 0;
+  const currentPayloadJson = currentRow ? String(currentRow.storage_state_json || '') : '';
+  const nextVersion = currentVersion > 0
+    ? currentPayloadJson === payloadJson
+      ? currentVersion
+      : currentVersion + 1
+    : 1;
+  await conn.execute(
+    `
+      INSERT INTO cp_account_auth_states (profile_name, storage_state_json, version, source, updated_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3))
+      ON DUPLICATE KEY UPDATE
+        storage_state_json = VALUES(storage_state_json),
+        version = VALUES(version),
+        source = VALUES(source),
+        updated_at = CURRENT_TIMESTAMP(3)
+    `,
+    [profile, payloadJson, nextVersion, String(source || 'capture')],
+  );
+  const existingConfigs = await loadProfileConfigRowsTx(conn, [profile]);
+  await ensureProfileRowsTx(conn, {
+    [profile]: existingConfigs.get(profile) || {},
+  }, { pruneMissing: false });
+  return {
+    profileName: profile,
+    version: nextVersion,
+    changed: currentPayloadJson !== payloadJson,
+  };
 }
 
 async function mirrorAccountStorageState(profileName, storageState, { source = 'capture' } = {}) {
   if (!mysql.isEnabled()) return { ok: false, reason: 'mysql disabled' };
   await ensureSchema();
-  const profile = String(profileName || '').trim();
-  if (!profile) throw new Error('profile required');
-  const payload = storageState && typeof storageState === 'object' ? storageState : {};
-  await mysql.transaction(async (conn) => {
-    await conn.execute(
-      `
-        INSERT INTO cp_accounts (profile_name, status, created_at, updated_at)
-        VALUES (?, 'active', CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))
-        ON DUPLICATE KEY UPDATE
-          updated_at = CURRENT_TIMESTAMP(3)
-      `,
-      [profile],
-    );
-    const [rows] = await conn.execute(
-      `SELECT version FROM cp_account_auth_states WHERE profile_name = ? LIMIT 1`,
-      [profile],
-    );
-    const currentVersion = Array.isArray(rows) && rows[0] ? Number(rows[0].version || 0) : 0;
-    const nextVersion = currentVersion + 1;
-    await conn.execute(
-      `
-        INSERT INTO cp_account_auth_states (profile_name, storage_state_json, version, source, updated_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3))
-        ON DUPLICATE KEY UPDATE
-          storage_state_json = VALUES(storage_state_json),
-          version = VALUES(version),
-          source = VALUES(source),
-          updated_at = CURRENT_TIMESTAMP(3)
-      `,
-      [profile, safeJsonStringify(payload), nextVersion || 1, String(source || 'capture')],
-    );
-  });
-  return { ok: true };
+  const result = await mysql.transaction(async (conn) =>
+    upsertAccountStorageStateTx(conn, profileName, storageState, { source }),
+  );
+  return { ok: true, ...result };
 }
 
 async function deleteMirroredAccount(profileName) {
@@ -514,6 +697,105 @@ async function deleteMirroredAccount(profileName) {
     await conn.execute(`DELETE FROM cp_profiles WHERE profile_name = ?`, [profile]);
   });
   return { ok: true };
+}
+
+function mapAccountControlRow(row) {
+  if (!row) return null;
+  return {
+    profileName: String(row.profile_name || ''),
+    status: String(row.status || 'active'),
+    maxConcurrency: normalizeAccountMaxConcurrency(row.max_concurrency, DEFAULT_ACCOUNT_MAX_CONCURRENCY),
+    note: row.note ? String(row.note) : '',
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at || null,
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at || null,
+  };
+}
+
+async function listAccountControls({ profileNames = [] } = {}) {
+  if (!mysql.isEnabled()) return [];
+  await ensureSchema();
+  return mysql.withConnection(async (conn) => {
+    let rows;
+    if (Array.isArray(profileNames) && profileNames.length) {
+      const values = Array.from(new Set(profileNames.map((value) => String(value || '').trim()).filter(Boolean)));
+      if (!values.length) return [];
+      const placeholders = values.map(() => '?').join(', ');
+      const [result] = await conn.execute(
+        `
+          SELECT profile_name, status, max_concurrency, note, created_at, updated_at
+          FROM cp_accounts
+          WHERE profile_name IN (${placeholders})
+          ORDER BY profile_name ASC
+        `,
+        values,
+      );
+      rows = result;
+    } else {
+      const [result] = await conn.execute(
+        `
+          SELECT profile_name, status, max_concurrency, note, created_at, updated_at
+          FROM cp_accounts
+          ORDER BY profile_name ASC
+        `,
+      );
+      rows = result;
+    }
+    return (Array.isArray(rows) ? rows : []).map(mapAccountControlRow).filter(Boolean);
+  });
+}
+
+async function upsertAccountControl({ profileName, maxConcurrency, note = null, actorId = 'admin' }) {
+  if (!mysql.isEnabled()) throw new Error('mysql disabled');
+  await ensureSchema();
+  const profile = String(profileName || '').trim();
+  if (!profile) throw new Error('profile required');
+  const nextMaxConcurrency = normalizeAccountMaxConcurrency(maxConcurrency, DEFAULT_ACCOUNT_MAX_CONCURRENCY);
+  const nextNote = note == null ? null : String(note).trim() || null;
+  return mysql.transaction(async (conn) => {
+    const [beforeRows] = await conn.execute(
+      `
+        SELECT profile_name, status, max_concurrency, note, created_at, updated_at
+        FROM cp_accounts
+        WHERE profile_name = ?
+        LIMIT 1
+      `,
+      [profile],
+    );
+    const before = mapAccountControlRow(Array.isArray(beforeRows) ? beforeRows[0] : null);
+    await conn.execute(
+      `
+        INSERT INTO cp_accounts
+        (profile_name, status, max_concurrency, note, created_at, updated_at)
+        VALUES (?, 'active', ?, ?, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))
+        ON DUPLICATE KEY UPDATE
+          status = 'active',
+          max_concurrency = VALUES(max_concurrency),
+          note = VALUES(note),
+          updated_at = CURRENT_TIMESTAMP(3)
+      `,
+      [profile, nextMaxConcurrency, nextNote],
+    );
+    const [afterRows] = await conn.execute(
+      `
+        SELECT profile_name, status, max_concurrency, note, created_at, updated_at
+        FROM cp_accounts
+        WHERE profile_name = ?
+        LIMIT 1
+      `,
+      [profile],
+    );
+    const after = mapAccountControlRow(Array.isArray(afterRows) ? afterRows[0] : null);
+    await writeAuditLog({
+      actorKind: 'admin',
+      actorId,
+      action: 'update_account_control',
+      targetKind: 'account',
+      targetId: profile,
+      before,
+      after,
+    });
+    return after;
+  });
 }
 
 async function bootstrapLegacyMirror({ store, accounts }) {
@@ -532,6 +814,59 @@ async function bootstrapLegacyMirror({ store, accounts }) {
     }
   }
   bootstrapDone = true;
+}
+
+async function syncControlPlaneSnapshot({ store, accounts, actorId = 'admin', source = 'manual_sync' } = {}) {
+  if (!mysql.isEnabled()) return { ok: false, reason: 'mysql disabled' };
+  await ensureSchema();
+  const snapshot = store && typeof store === 'object' ? store : {};
+  const accountMap = accounts && typeof accounts === 'object' ? accounts : {};
+  const names = Array.from(
+    new Set(
+      Object.keys(accountMap)
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => left.localeCompare(right, 'zh-CN'));
+
+  const summary = await mysql.transaction(async (conn) => {
+    let changedAuthStates = 0;
+    for (const name of names) {
+      const state = accountMap[name];
+      if (!state || typeof state !== 'object') continue;
+      const result = await upsertAccountStorageStateTx(conn, name, state, { source });
+      if (result.changed) changedAuthStates += 1;
+    }
+
+    if (names.length) {
+      const placeholders = names.map(() => '?').join(', ');
+      await conn.execute(`DELETE FROM cp_account_auth_states WHERE profile_name NOT IN (${placeholders})`, names);
+      await conn.execute(`DELETE FROM cp_accounts WHERE profile_name NOT IN (${placeholders})`, names);
+    } else {
+      await conn.execute('DELETE FROM cp_account_auth_states');
+      await conn.execute('DELETE FROM cp_accounts');
+    }
+
+    const storeSummary = await mirrorStoreSnapshotTx(conn, snapshot, {
+      preserveProfileNames: names,
+    });
+
+    return {
+      ...storeSummary,
+      accounts: names.length,
+      changedAuthStates,
+    };
+  });
+
+  await writeAuditLog({
+    actorKind: 'admin',
+    actorId,
+    action: 'sync_control_plane_snapshot',
+    targetKind: 'system',
+    targetId: 'control_plane_mysql',
+    after: summary,
+  });
+  return { ok: true, summary };
 }
 
 function normalizeClientAssetInput(input) {
@@ -608,10 +943,28 @@ async function registerClientAsset({ machineId, body }) {
 
 function normalizeTaskCreateInput(task, defaults = {}) {
   const item = task && typeof task === 'object' ? task : {};
+  const channel = String(item.channel || 'flow').trim().toLowerCase() || 'flow';
+  const provider = String(item.provider || '1').trim() || '1';
   const taskType = String(item.taskType || item.task_type || 'image').trim().toLowerCase();
   if (!['image', 'video'].includes(taskType)) throw new Error(`unsupported taskType: ${taskType}`);
   const prompt = String(item.prompt || '').trim();
   if (!prompt) throw new Error('prompt required');
+  const rawInputPayload = item.inputPayload && typeof item.inputPayload === 'object' ? item.inputPayload : {};
+  const rawParams = rawInputPayload.params && typeof rawInputPayload.params === 'object'
+    ? rawInputPayload.params
+    : item.params && typeof item.params === 'object'
+      ? item.params
+      : {};
+  const rawTaskSettings = item.taskSettings && typeof item.taskSettings === 'object'
+    ? item.taskSettings
+    : rawInputPayload.taskSettings && typeof rawInputPayload.taskSettings === 'object'
+      ? rawInputPayload.taskSettings
+      : {};
+  const rawOutputSettings = item.outputSettings && typeof item.outputSettings === 'object'
+    ? item.outputSettings
+    : rawInputPayload.outputSettings && typeof rawInputPayload.outputSettings === 'object'
+      ? rawInputPayload.outputSettings
+      : {};
   const priority = Number.isFinite(Number(item.priority)) ? Math.round(Number(item.priority)) : defaults.priority;
   const maxAttempts = Number.isFinite(Number(item.maxAttempts))
     ? Math.max(1, Math.min(20, Math.round(Number(item.maxAttempts))))
@@ -622,17 +975,60 @@ function normalizeTaskCreateInput(task, defaults = {}) {
       ? DEFAULT_VIDEO_TIMEOUT
       : DEFAULT_IMAGE_TIMEOUT;
   const inputPayload = {
-    referenceAssetId: item.referenceAssetId ? String(item.referenceAssetId) : null,
-    referenceAssetIds: Array.isArray(item.referenceAssetIds)
-      ? item.referenceAssetIds.map((value) => String(value)).filter(Boolean)
-      : [],
-    modelName: item.modelName ? String(item.modelName) : null,
-    aspectRatio: item.aspectRatio ? String(item.aspectRatio) : null,
-    humanSpeedPreset: item.humanSpeedPreset ? String(item.humanSpeedPreset) : null,
-    taskSettings: item.taskSettings && typeof item.taskSettings === 'object' ? item.taskSettings : {},
-    outputSettings: item.outputSettings && typeof item.outputSettings === 'object' ? item.outputSettings : {},
+    ...rawInputPayload,
+    channel,
+    provider,
+    operation: rawInputPayload.operation
+      ? String(rawInputPayload.operation)
+      : item.operation
+        ? String(item.operation)
+        : String(rawInputPayload.operation || `${channel}.run`),
+    assets: Array.isArray(rawInputPayload.assets)
+      ? rawInputPayload.assets
+      : Array.isArray(item.assets)
+        ? item.assets
+        : [],
+    submit_meta: rawInputPayload.submit_meta && typeof rawInputPayload.submit_meta === 'object'
+      ? rawInputPayload.submit_meta
+      : item.submitMeta && typeof item.submitMeta === 'object'
+        ? item.submitMeta
+        : {},
+    params: rawParams,
+    referenceAssetId:
+      rawInputPayload.referenceAssetId != null
+        ? String(rawInputPayload.referenceAssetId)
+        : item.referenceAssetId
+          ? String(item.referenceAssetId)
+          : null,
+    referenceAssetIds: Array.isArray(rawInputPayload.referenceAssetIds)
+      ? rawInputPayload.referenceAssetIds.map((value) => String(value)).filter(Boolean)
+      : Array.isArray(item.referenceAssetIds)
+        ? item.referenceAssetIds.map((value) => String(value)).filter(Boolean)
+        : [],
+    modelName:
+      rawInputPayload.modelName != null
+        ? String(rawInputPayload.modelName)
+        : item.modelName
+          ? String(item.modelName)
+          : null,
+    aspectRatio:
+      rawInputPayload.aspectRatio != null
+        ? String(rawInputPayload.aspectRatio)
+        : item.aspectRatio
+          ? String(item.aspectRatio)
+          : null,
+    humanSpeedPreset:
+      rawInputPayload.humanSpeedPreset != null
+        ? String(rawInputPayload.humanSpeedPreset)
+        : item.humanSpeedPreset
+          ? String(item.humanSpeedPreset)
+          : null,
+    taskSettings: rawTaskSettings,
+    outputSettings: rawOutputSettings,
   };
   return {
+    channel,
+    provider,
     taskType,
     prompt,
     priority: Number.isFinite(priority) ? priority : DEFAULT_PRIORITY,
@@ -664,8 +1060,10 @@ async function refreshBatchStatus(batchId, conn = null) {
   return mysql.withConnection(run);
 }
 
-async function createClientTaskBatch({ machineId, body }) {
+async function createClientTaskBatch({ machineId, targetMachineId = '', body }) {
   await ensureSchema();
+  const createdByMachineId = String(machineId || '').trim();
+  if (!createdByMachineId) throw new Error('machineId required');
   const payload = body && typeof body === 'object' ? body : {};
   const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
   if (!tasks.length) throw new Error('tasks required');
@@ -679,6 +1077,7 @@ async function createClientTaskBatch({ machineId, body }) {
     : new Date(Date.now() + DEFAULT_EXPIRE_SEC * 1000);
   if (!Number.isFinite(expireAt.getTime())) throw new Error('invalid expireAt');
   const createdByKind = String(payload.createdByKind || 'client').trim() || 'client';
+  const effectiveTargetMachineId = String(targetMachineId || payload.targetMachineId || '').trim() || createdByMachineId;
 
   return mysql.transaction(async (conn) => {
     const [existingRows] = await conn.execute(
@@ -688,10 +1087,10 @@ async function createClientTaskBatch({ machineId, body }) {
         WHERE created_by_machine_id = ? AND idempotency_key = ?
         LIMIT 1
       `,
-      [machineId, idempotencyKey],
+      [createdByMachineId, idempotencyKey],
     );
     if (Array.isArray(existingRows) && existingRows[0]) {
-      return getClientTaskBatch({ machineId, batchId: String(existingRows[0].id), conn });
+      return getClientTaskBatch({ machineId: createdByMachineId, batchId: String(existingRows[0].id), conn });
     }
 
     const batchId = makeId('batch');
@@ -703,8 +1102,8 @@ async function createClientTaskBatch({ machineId, body }) {
       `,
       [
         batchId,
-        machineId,
-        machineId,
+        effectiveTargetMachineId,
+        createdByMachineId,
         createdByKind,
         idempotencyKey,
         priority,
@@ -724,14 +1123,16 @@ async function createClientTaskBatch({ machineId, body }) {
       await conn.execute(
         `
           INSERT INTO tasks
-          (id, batch_id, target_machine_id, created_by_machine_id, task_type, prompt, input_payload_json, required_account_profile, status, priority, attempt_count, max_attempts, next_retry_at, expire_at, run_timeout_seconds)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, CURRENT_TIMESTAMP(3), ?, ?)
+          (id, batch_id, target_machine_id, created_by_machine_id, channel, provider, task_type, prompt, input_payload_json, required_account_profile, status, priority, attempt_count, max_attempts, next_retry_at, expire_at, run_timeout_seconds)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, CURRENT_TIMESTAMP(3), ?, ?)
         `,
         [
           taskId,
           batchId,
-          machineId,
-          machineId,
+          effectiveTargetMachineId,
+          createdByMachineId,
+          item.channel,
+          item.provider,
           item.taskType,
           item.prompt,
           safeJsonStringify(item.inputPayload),
@@ -745,18 +1146,19 @@ async function createClientTaskBatch({ machineId, body }) {
     }
     await writeAuditLog({
       actorKind: 'client_machine',
-      actorId: machineId,
+      actorId: createdByMachineId,
       action: 'create_batch',
       targetKind: 'task_batch',
       targetId: batchId,
       after: {
         batchId,
         taskCount: normalizedTasks.length,
+        targetMachineId: effectiveTargetMachineId,
         priority,
         expireAt: expireAt.toISOString(),
       },
     });
-    return getClientTaskBatch({ machineId, batchId, conn });
+    return getClientTaskBatch({ machineId: createdByMachineId, batchId, conn });
   });
 }
 
@@ -788,6 +1190,8 @@ function mapTaskRow(row, { runs = [], artifacts = [] } = {}) {
     batchId: String(row.batch_id),
     targetMachineId: String(row.target_machine_id),
     createdByMachineId: String(row.created_by_machine_id),
+    channel: String(row.channel || 'flow'),
+    provider: String(row.provider || '1'),
     taskType: String(row.task_type),
     prompt: String(row.prompt),
     inputPayload: safeJsonParse(row.input_payload_json, {}),
@@ -930,10 +1334,11 @@ async function getClientTask({ machineId, taskId, conn = null }) {
       `
         SELECT *
         FROM tasks
-        WHERE id = ? AND target_machine_id = ?
+        WHERE id = ?
+          AND (created_by_machine_id = ? OR target_machine_id = ?)
         LIMIT 1
       `,
-      [taskId, machineId],
+      [taskId, machineId, machineId],
     );
     const row = Array.isArray(rows) ? rows[0] : null;
     if (!row) return null;
@@ -955,10 +1360,11 @@ async function getClientTaskBatch({ machineId, batchId, conn = null }) {
       `
         SELECT *
         FROM task_batches
-        WHERE id = ? AND target_machine_id = ?
+        WHERE id = ?
+          AND (created_by_machine_id = ? OR target_machine_id = ?)
         LIMIT 1
       `,
-      [batchId, machineId],
+      [batchId, machineId, machineId],
     );
     const batchRow = Array.isArray(batchRows) ? batchRows[0] : null;
     if (!batchRow) return null;
@@ -981,6 +1387,37 @@ async function getClientTaskBatch({ machineId, batchId, conn = null }) {
       }),
     );
     return mapBatchRow(batchRow, tasks);
+  };
+  if (conn) return run(conn);
+  return mysql.withConnection(run);
+}
+
+async function listClientTaskBatches({ machineId, limit = 20, conn = null }) {
+  await ensureSchema();
+  const requesterMachineId = String(machineId || '').trim();
+  if (!requesterMachineId) throw new Error('machineId required');
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 20));
+  const run = async (db) => {
+    const [rows] = await db.query(
+      `
+        SELECT id
+        FROM task_batches
+        WHERE created_by_machine_id = ?
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT ${safeLimit}
+      `,
+      [requesterMachineId],
+    );
+    const out = [];
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const batch = await getClientTaskBatch({
+        machineId: requesterMachineId,
+        batchId: String(row.id),
+        conn: db,
+      });
+      if (batch) out.push(batch);
+    }
+    return out;
   };
   if (conn) return run(conn);
   return mysql.withConnection(run);
@@ -1032,6 +1469,109 @@ async function listAdminTasks({
       artifacts: artifactsMap.get(String(row.id)) || [],
     }),
   );
+}
+
+function normalizeStatsDays(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 30;
+  return Math.max(1, Math.min(365, Math.round(n)));
+}
+
+function mapCountRow(row) {
+  return {
+    key: String(row.key || ''),
+    totalTasks: Number(row.total_tasks || 0),
+    queuedTasks: Number(row.queued_tasks || 0),
+    runningTasks: Number(row.running_tasks || 0),
+    succeededTasks: Number(row.succeeded_tasks || 0),
+    failedTasks: Number(row.failed_tasks || 0),
+    cancelledTasks: Number(row.cancelled_tasks || 0),
+    totalRuns: Number(row.total_runs || 0),
+    outputCount: Number(row.output_count || 0),
+    firstCreatedAt: row.first_created_at instanceof Date ? row.first_created_at.toISOString() : row.first_created_at || null,
+    lastUpdatedAt: row.last_updated_at instanceof Date ? row.last_updated_at.toISOString() : row.last_updated_at || null,
+  };
+}
+
+async function getAdminTaskStats({ days = 30, machineId = '' } = {}) {
+  await ensureSchema();
+  const safeDays = normalizeStatsDays(days);
+  const clauses = [`t.created_at >= DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ${safeDays} DAY)`];
+  const params = [];
+  const normalizedMachineId = String(machineId || '').trim();
+  if (normalizedMachineId) {
+    clauses.push('(t.target_machine_id = ? OR t.created_by_machine_id = ?)');
+    params.push(normalizedMachineId, normalizedMachineId);
+  }
+  const whereSql = clauses.join(' AND ');
+  const baseJoin = `
+    FROM tasks t
+    LEFT JOIN (
+      SELECT task_id, COUNT(*) AS run_count
+      FROM task_runs
+      GROUP BY task_id
+    ) tr ON tr.task_id = t.id
+    LEFT JOIN (
+      SELECT task_id, COUNT(*) AS artifact_count
+      FROM task_artifacts
+      GROUP BY task_id
+    ) ta ON ta.task_id = t.id
+    WHERE ${whereSql}
+  `;
+  const summaryRows = await mysql.query(
+    `
+      SELECT
+        COUNT(*) AS total_tasks,
+        SUM(t.status = 'queued') AS queued_tasks,
+        SUM(t.status = 'running') AS running_tasks,
+        SUM(t.status = 'succeeded') AS succeeded_tasks,
+        SUM(t.status = 'failed') AS failed_tasks,
+        SUM(t.status IN ('cancelled', 'cancel_requested', 'expired')) AS cancelled_tasks,
+        COALESCE(SUM(tr.run_count), 0) AS total_runs,
+        COALESCE(SUM(ta.artifact_count), 0) AS output_count,
+        MIN(t.created_at) AS first_created_at,
+        MAX(t.updated_at) AS last_updated_at
+      ${baseJoin}
+    `,
+    params,
+  );
+  const groupedSql = (expr) => `
+      SELECT
+        ${expr} AS \`key\`,
+        COUNT(*) AS total_tasks,
+        SUM(t.status = 'queued') AS queued_tasks,
+        SUM(t.status = 'running') AS running_tasks,
+        SUM(t.status = 'succeeded') AS succeeded_tasks,
+        SUM(t.status = 'failed') AS failed_tasks,
+        SUM(t.status IN ('cancelled', 'cancel_requested', 'expired')) AS cancelled_tasks,
+        COALESCE(SUM(tr.run_count), 0) AS total_runs,
+        COALESCE(SUM(ta.artifact_count), 0) AS output_count,
+        MIN(t.created_at) AS first_created_at,
+        MAX(t.updated_at) AS last_updated_at
+      ${baseJoin}
+      GROUP BY ${expr}
+      ORDER BY total_tasks DESC, output_count DESC, \`key\` ASC
+      LIMIT 100
+    `;
+  const [bySubmitter, byExecutor, byChannel, byStatus] = await Promise.all([
+    mysql.query(groupedSql('t.created_by_machine_id'), params),
+    mysql.query(groupedSql('t.target_machine_id'), params),
+    mysql.query(groupedSql("CONCAT(t.channel, '.', t.provider, '/', t.task_type)"), params),
+    mysql.query(groupedSql('t.status'), params),
+  ]);
+  const summary = mapCountRow({ key: 'all', ...(Array.isArray(summaryRows) && summaryRows[0] ? summaryRows[0] : {}) });
+  return {
+    filters: { days: safeDays, machineId: normalizedMachineId || null },
+    summary,
+    bySubmitter: (Array.isArray(bySubmitter) ? bySubmitter : []).map(mapCountRow),
+    byExecutor: (Array.isArray(byExecutor) ? byExecutor : []).map(mapCountRow),
+    byChannel: (Array.isArray(byChannel) ? byChannel : []).map(mapCountRow),
+    byStatus: (Array.isArray(byStatus) ? byStatus : []).map(mapCountRow),
+    usage: {
+      available: false,
+      note: 'Provider token/credit/cost extraction is not connected yet; current stats cover task, run, and output counts.',
+    },
+  };
 }
 
 async function listAdminBatches({ limit = 50, machineId = '', status = '' }) {
@@ -1165,16 +1705,21 @@ async function retryTaskByAdmin({ taskId, actorId }) {
 }
 
 module.exports = {
+  DEFAULT_ACCOUNT_MAX_CONCURRENCY,
   DEFAULT_IMAGE_TIMEOUT,
   DEFAULT_MAX_ATTEMPTS,
   DEFAULT_STORAGE_ROOT_KEY,
   DEFAULT_VIDEO_TIMEOUT,
+  MAX_ACCOUNT_MAX_CONCURRENCY,
   bootstrapLegacyMirror,
   cancelTaskByAdmin,
   createClientTaskBatch,
   ensureSchema,
   getClientTask,
   getClientTaskBatch,
+  getAdminTaskStats,
+  listClientTaskBatches,
+  listAccountControls,
   listAdminBatches,
   listAdminTasks,
   deleteMirroredAccount,
@@ -1182,4 +1727,6 @@ module.exports = {
   mirrorStoreSnapshot,
   registerClientAsset,
   retryTaskByAdmin,
+  syncControlPlaneSnapshot,
+  upsertAccountControl,
 };

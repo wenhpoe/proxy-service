@@ -14,4 +14,4 @@ build/bundled.env
 # Runtime artifacts
 runtime/
 tmp/
-
+output/

@@ -91,6 +91,11 @@
             <div class="sub">
               服务端保存路径：<span class="tag" id="accountsDir">—</span>
             </div>
+            <div style="height: 8px"></div>
+            <div class="hint">
+              “最大并发”表示该账号最多允许被 <span class="mono">auto-gen</span> 同时占用多少个执行 slot。设置为
+              <span class="mono">0</span> 表示暂不参与执行分流。
+            </div>
             <div style="height: 10px"></div>
             <div class="tablebox" style="max-height: 62vh">
               <table>
@@ -99,6 +104,7 @@
                     <th>账号</th>
                     <th style="width: 180px">更新时间</th>
                     <th style="width: 110px">大小</th>
+                    <th style="width: 210px">最大并发</th>
                     <th style="width: 250px">操作</th>
                   </tr>
                 </thead>
@@ -192,6 +198,7 @@
         poolItems: [],
         policyLoadedFor: null,
         selectedPolicyItems: [], // [{ poolItemId, priority }]
+        maxAccountConcurrencyLimit: 32,
       };
 
       let pager = null;
@@ -428,17 +435,33 @@
 
         if (!filtered.length) {
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td colspan="4" class="sub" style="padding:12px">暂无账号（或搜索无结果）。</td>`;
+          tr.innerHTML = `<td colspan="5" class="sub" style="padding:12px">暂无账号（或搜索无结果）。</td>`;
           tbody.appendChild(tr);
           return;
         }
 
         for (const p of pageItems) {
+          const maxConcurrency = Number.isFinite(Number(p.maxConcurrency)) ? Number(p.maxConcurrency) : 0;
           const tr = document.createElement("tr");
           tr.innerHTML = `
             <td class="mono">${esc(p.name)}</td>
             <td class="mono">${esc(ts(p.updatedAt))}</td>
             <td class="mono">${esc(p.size || 0)}</td>
+            <td>
+              <div class="row">
+                <input
+                  class="input mono"
+                  type="number"
+                  min="0"
+                  max="${esc(state.maxAccountConcurrencyLimit || 32)}"
+                  step="1"
+                  style="width:88px"
+                  data-account-control-input="${esc(p.name)}"
+                  value="${esc(maxConcurrency)}"
+                />
+                <button class="btn sm" data-save-account-control="${esc(p.name)}">保存</button>
+              </div>
+            </td>
             <td>
               <div class="row">
                 <button class="btn sm" data-fill="${esc(p.name)}">填入</button>
@@ -454,10 +477,53 @@
       async function listAccounts() {
         const r = await j("/v1/admin/accounts");
         $("accountsDir").textContent = r.accountsDir || "—";
+        state.maxAccountConcurrencyLimit = Number.isFinite(Number(r.maxAccountConcurrencyLimit))
+          ? Number(r.maxAccountConcurrencyLimit)
+          : 32;
         state.profiles = Array.isArray(r.profiles) ? r.profiles : [];
         pager?.reset();
         renderAccounts();
         return state.profiles;
+      }
+
+      function findAccountControlInput(profileName) {
+        return Array.from(document.querySelectorAll("input[data-account-control-input]")).find(
+          (el) => el.getAttribute("data-account-control-input") === profileName,
+        );
+      }
+
+      async function saveAccountControl(profileName) {
+        const name = String(profileName || "").trim();
+        if (!name) return setStatus("statusAcc", "warn", "账号名称不能为空");
+        const input = findAccountControlInput(name);
+        if (!input) return setStatus("statusAcc", "bad", `未找到账号输入框：${name}`);
+        const raw = String(input.value || "").trim();
+        const nextValue = raw === "" ? 0 : Number(raw);
+        if (!Number.isFinite(nextValue) || nextValue < 0) {
+          return setStatus("statusAcc", "warn", "请输入大于等于 0 的整数");
+        }
+        const cap = Number.isFinite(Number(state.maxAccountConcurrencyLimit)) ? Number(state.maxAccountConcurrencyLimit) : 32;
+        if (nextValue > cap) {
+          return setStatus("statusAcc", "warn", `最大并发不能超过 ${cap}`);
+        }
+        try {
+          setStatus("statusAcc", "warn", `保存账号并发中：${name}…`);
+          const r = await j(`/v1/admin/accounts/${encodeURIComponent(name)}/control`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ maxConcurrency: Math.round(nextValue) }),
+          });
+          const control = r && r.control ? r.control : null;
+          const profile = state.profiles.find((item) => String(item.name) === name);
+          if (profile && control) {
+            profile.maxConcurrency = control.maxConcurrency;
+            profile.controlUpdatedAt = control.updatedAt || null;
+          }
+          renderAccounts();
+          setStatus("statusAcc", "good", `已保存：${name} 并发 ${control ? control.maxConcurrency : Math.round(nextValue)}`);
+        } catch (e) {
+          setStatus("statusAcc", "bad", e.message || "保存并发失败");
+        }
       }
 
       async function refreshPoolItems() {
@@ -775,9 +841,15 @@
       });
 
       $("accountsTbody").addEventListener("click", async (e) => {
+        const saveControl = e.target.closest("[data-save-account-control]");
         const fill = e.target.closest("[data-fill]");
         const policy = e.target.closest("[data-policy]");
         const del = e.target.closest("[data-del]");
+        if (saveControl) {
+          const name = saveControl.getAttribute("data-save-account-control");
+          await saveAccountControl(name);
+          return;
+        }
         if (fill) {
           const name = fill.getAttribute("data-fill");
           $("capProfile").value = name || "";
@@ -795,6 +867,14 @@
           const name = del.getAttribute("data-del");
           await deleteAccount(name);
         }
+      });
+
+      $("accountsTbody").addEventListener("keydown", async (e) => {
+        const input = e.target.closest("input[data-account-control-input]");
+        if (!input || e.key !== "Enter") return;
+        e.preventDefault();
+        const name = input.getAttribute("data-account-control-input");
+        if (name) await saveAccountControl(name);
       });
 
       $("policyPoolTbody").addEventListener("click", (e) => {
