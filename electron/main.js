@@ -1,4 +1,6 @@
 const { app, BrowserWindow, shell, dialog, ipcMain } = require('electron');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -90,22 +92,55 @@ async function showStartupError(win, title, message, detail) {
   }
 }
 
+function requestUrlOnce(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    let req = null;
+    try {
+      const target = new URL(url);
+      const client = target.protocol === 'https:' ? https : http;
+      req = client.request(
+        target,
+        {
+          method: 'GET',
+          timeout: timeoutMs,
+        },
+        (res) => {
+          res.resume();
+          resolve({ ok: res.statusCode >= 200 && res.statusCode < 500, statusCode: res.statusCode || 0 });
+        },
+      );
+      req.on('error', reject);
+      req.on('timeout', () => {
+        req.destroy(new Error('request timeout'));
+      });
+      timer = setTimeout(() => {
+        req.destroy(new Error('request timeout'));
+      }, timeoutMs + 50);
+      req.end();
+    } catch (err) {
+      reject(err);
+    } finally {
+      if (req) {
+        req.once('close', () => {
+          if (timer) clearTimeout(timer);
+        });
+      } else if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  });
+}
+
 async function waitForHttpReady(baseUrl, timeoutMs = 6000) {
   const startedAt = Date.now();
   const healthUrl = `${String(baseUrl || '').replace(/\/+$/, '')}/health`;
   let lastError = null;
   while (Date.now() - startedAt < timeoutMs) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 1200);
-      let res;
-      try {
-        res = await fetch(healthUrl, { signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (res.ok) return { ok: true };
-      lastError = new Error(`HTTP ${res.status}`);
+      const res = await requestUrlOnce(healthUrl, 1200);
+      if (res.ok) return { ok: true, statusCode: res.statusCode };
+      lastError = new Error(`HTTP ${res.statusCode}`);
     } catch (err) {
       lastError = err;
     }
@@ -368,13 +403,7 @@ async function createWindow() {
 
   const ready = await waitForHttpReady(serverHandle.baseUrl);
   if (!ready.ok) {
-    await showStartupError(
-      win,
-      '代理服务已启动，但页面不可访问',
-      '本地接口已监听，但健康检查没有通过。',
-      `health: ${ready.url}\nerror: ${ready.error}\nlog: ${startupLogPath()}`,
-    );
-    return win;
+    appendStartupLog(`health probe warning: ${ready.url} ${ready.error}`);
   }
 
   try {
