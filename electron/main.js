@@ -303,6 +303,9 @@ async function createWindow() {
     appendStartupLog('starting embedded proxy server');
     serverHandle = await startServer();
     appendStartupLog(`embedded proxy server started: ${serverHandle.baseUrl}`);
+    if (serverHandle.publicBaseUrl && serverHandle.publicBaseUrl !== serverHandle.baseUrl) {
+      appendStartupLog(`embedded proxy server public listener: ${serverHandle.publicBaseUrl}`);
+    }
   } catch (err) {
     const msg = err && err.message ? String(err.message) : String(err);
     appendStartupLog(`embedded proxy server failed: ${msg}`);
@@ -395,8 +398,8 @@ async function createWindow() {
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', (e, url) => {
-    if (!serverHandle?.baseUrl) return;
-    if (url.startsWith(serverHandle.baseUrl)) return;
+    const allowedBaseUrls = [serverHandle?.baseUrl, serverHandle?.publicBaseUrl].filter(Boolean);
+    if (allowedBaseUrls.some((baseUrl) => url.startsWith(baseUrl))) return;
     e.preventDefault();
     shell.openExternal(url);
   });
@@ -409,11 +412,15 @@ async function createWindow() {
   try {
     await win.loadURL(`${serverHandle.baseUrl}/`);
   } catch (err) {
+    const msg = err?.message || String(err);
+    if (String(msg).includes('ERR_ABORTED') && String(win.webContents.getURL() || '').startsWith('data:text/html')) {
+      return win;
+    }
     await showStartupError(
       win,
       '管理页面加载失败',
       'Electron 加载本地管理页面失败。',
-      `${err?.stack || err?.message || String(err)}\nURL: ${serverHandle.baseUrl}/\nlog: ${startupLogPath()}`,
+      `${err?.stack || msg}\nURL: ${serverHandle.baseUrl}/\nlog: ${startupLogPath()}`,
     );
   }
   return win;
@@ -457,8 +464,24 @@ ipcMain.handle('update:openLog', async () => {
 });
 
 async function shutdown() {
-  if (!serverHandle?.server) return;
-  await new Promise((resolve) => serverHandle.server.close(() => resolve()));
+  const servers = Array.isArray(serverHandle?.servers) && serverHandle.servers.length
+    ? serverHandle.servers
+    : serverHandle?.server
+      ? [serverHandle.server]
+      : [];
+  if (!servers.length) return;
+  await Promise.allSettled(
+    servers.map(
+      (server) =>
+        new Promise((resolve) => {
+          try {
+            server.close(() => resolve());
+          } catch {
+            resolve();
+          }
+        }),
+    ),
+  );
   serverHandle = null;
 }
 

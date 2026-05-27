@@ -350,7 +350,10 @@ const RUNTIME = {
   port: PORT,
   actualPort: null,
   baseUrl: null,
+  publicBaseUrl: null,
+  uiBaseUrl: null,
   lanUrls: [],
+  listeners: [],
   startedAt: null,
 };
 
@@ -2878,7 +2881,10 @@ app.get('/health', (_req, res) =>
     port: RUNTIME.port,
     actualPort: RUNTIME.actualPort,
     baseUrl: RUNTIME.baseUrl,
+    publicBaseUrl: RUNTIME.publicBaseUrl,
+    uiBaseUrl: RUNTIME.uiBaseUrl,
     lanUrls: RUNTIME.lanUrls,
+    listeners: RUNTIME.listeners,
     mysql: {
       enabled: mysqlCtl.isEnabled(),
       hasConfig: mysqlCtl.hasMysqlConfig(),
@@ -5353,73 +5359,133 @@ app.delete('/v1/proxy-policy/:profile', (req, res) => {
   res.json({ ok: true, profile, storeUpdatedAt: written.updatedAt });
 });
 
-function startServer({ port = PORT, host = HOST } = {}) {
-  ensureStore();
-  return ensureTaskSystemBootstrap().then(() => {
-    return new Promise((resolve, reject) => {
-      const server = app.listen(port, host);
-      server.once('error', reject);
-      server.once('listening', () => {
-        const addr = server.address();
-        const actualPort = addr && typeof addr === 'object' ? addr.port : port;
-        // If binding to 0.0.0.0, prefer a loopback URL for local UI / logs.
-        const baseHost = host === '0.0.0.0' ? '127.0.0.1' : host;
-        const baseUrl = `http://${baseHost}:${actualPort}`;
-        const lanUrls = [];
-        if (host === '0.0.0.0') {
-          try {
-            const nets = os.networkInterfaces();
-            for (const name of Object.keys(nets || {})) {
-              for (const net of nets[name] || []) {
-                if (!net || net.internal) continue;
-                if (net.family !== 'IPv4') continue;
-                lanUrls.push(`http://${net.address}:${actualPort}`);
-              }
-            }
-          } catch {
-            // ignore
-          }
-        }
-        RUNTIME.host = host;
-        RUNTIME.port = port;
-        RUNTIME.actualPort = actualPort;
-        RUNTIME.baseUrl = baseUrl;
-        RUNTIME.lanUrls = lanUrls;
-        RUNTIME.startedAt = nowIso();
-        console.log('🧩 Proxy Service started');
-        console.log(`📍 本机访问：${baseUrl}`);
-        if (lanUrls.length) {
-          console.log(`🌐 局域网访问：${lanUrls.join(' , ')}`);
-        }
-        console.log(`🗂️ store: ${STORE_PATH}`);
-        console.log('🔐 admin: open /login.html to sign in');
-        if (process.env.PROXY_UPSTREAM_URL) {
-          console.log(`🌐 upstream: ${process.env.PROXY_UPSTREAM_URL}`);
-        } else {
-          console.log('ℹ️ upstream: (disabled) set PROXY_UPSTREAM_URL to enable');
-        }
+function isLoopbackHost(host) {
+  const value = String(host || '').trim().toLowerCase();
+  return value === '127.0.0.1' || value === 'localhost' || value === '::1';
+}
 
-        if (isPoolAutoCheckEnabled()) {
-          startPoolNodeAutoToggleLoop(server);
-          const cfg = getPoolNodeAutoToggleDefaults();
-          console.log(`🧪 pool auto-check: enabled (nodes every ${Math.round(cfg.intervalMs / 1000)}s ×${cfg.tries})`);
-        } else {
-          console.log('🧪 pool auto-check: disabled (set PROXY_POOL_AUTOCHECK=1 to enable)');
+function describeListener({ host, actualPort }) {
+  const normalizedHost = String(host || '').trim() || HOST;
+  const localBaseHost = normalizedHost === '0.0.0.0' ? '127.0.0.1' : normalizedHost;
+  const baseUrl = `http://${localBaseHost}:${actualPort}`;
+  const lanUrls = [];
+  if (normalizedHost === '0.0.0.0') {
+    try {
+      const nets = os.networkInterfaces();
+      for (const name of Object.keys(nets || {})) {
+        for (const net of nets[name] || []) {
+          if (!net || net.internal) continue;
+          if (net.family !== 'IPv4') continue;
+          lanUrls.push(`http://${net.address}:${actualPort}`);
         }
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return {
+    host: normalizedHost,
+    actualPort,
+    baseUrl,
+    lanUrls,
+  };
+}
 
-        if (isPoolFlowAutoCheckEnabled()) {
-          startPoolFlowAutoCheckLoop(server);
-          const cfg = getPoolFlowAutoCheckDefaults();
-          console.log(
-            `🧪 pool flow precheck: enabled (every ${Math.round(cfg.intervalMs / 1000)}s, max ${cfg.maxItems}/tick, disableOnFail=${cfg.disableOnFail ? '1' : '0'})`,
-          );
-        } else {
-          console.log('🧪 pool flow precheck: disabled (set PROXY_POOL_FLOW_AUTOCHECK=1 to enable)');
-        }
-        resolve({ app, server, host, port: actualPort, baseUrl, lanUrls });
+function listenOnce({ port, host }) {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port, host);
+    server.once('error', reject);
+    server.once('listening', () => {
+      const addr = server.address();
+      const actualPort = addr && typeof addr === 'object' ? addr.port : port;
+      resolve({
+        server,
+        port: actualPort,
+        ...describeListener({ host, actualPort }),
       });
     });
   });
+}
+
+async function startServer({ port = PORT, host = HOST } = {}) {
+  ensureStore();
+  await ensureTaskSystemBootstrap();
+
+  const primary = await listenOnce({ port, host });
+  const listeners = [{ kind: 'public', ...primary }];
+  let uiListener = primary;
+
+  if (isElectronRuntime() && !isLoopbackHost(host)) {
+    try {
+      const localOnly = await listenOnce({ port: 0, host: '127.0.0.1' });
+      listeners.push({ kind: 'ui', ...localOnly });
+      uiListener = localOnly;
+    } catch (err) {
+      console.warn(`⚠️ 无法创建桌面端本机回环监听，回退到公共监听：${err?.message || err}`);
+    }
+  }
+
+  RUNTIME.host = primary.host;
+  RUNTIME.port = port;
+  RUNTIME.actualPort = primary.port;
+  RUNTIME.baseUrl = uiListener.baseUrl;
+  RUNTIME.publicBaseUrl = primary.baseUrl;
+  RUNTIME.uiBaseUrl = uiListener.baseUrl;
+  RUNTIME.lanUrls = primary.lanUrls;
+  RUNTIME.listeners = listeners.map((item) => ({
+    kind: item.kind,
+    host: item.host,
+    port: item.port,
+    baseUrl: item.baseUrl,
+  }));
+  RUNTIME.startedAt = nowIso();
+
+  console.log('🧩 Proxy Service started');
+  console.log(`📍 桌面端访问：${uiListener.baseUrl}`);
+  if (primary.baseUrl !== uiListener.baseUrl) {
+    console.log(`📍 本机公共访问：${primary.baseUrl}`);
+  }
+  if (primary.lanUrls.length) {
+    console.log(`🌐 局域网访问：${primary.lanUrls.join(' , ')}`);
+  }
+  console.log(`🗂️ store: ${STORE_PATH}`);
+  console.log('🔐 admin: open /login.html to sign in');
+  if (process.env.PROXY_UPSTREAM_URL) {
+    console.log(`🌐 upstream: ${process.env.PROXY_UPSTREAM_URL}`);
+  } else {
+    console.log('ℹ️ upstream: (disabled) set PROXY_UPSTREAM_URL to enable');
+  }
+
+  if (isPoolAutoCheckEnabled()) {
+    startPoolNodeAutoToggleLoop(primary.server);
+    const cfg = getPoolNodeAutoToggleDefaults();
+    console.log(`🧪 pool auto-check: enabled (nodes every ${Math.round(cfg.intervalMs / 1000)}s ×${cfg.tries})`);
+  } else {
+    console.log('🧪 pool auto-check: disabled (set PROXY_POOL_AUTOCHECK=1 to enable)');
+  }
+
+  if (isPoolFlowAutoCheckEnabled()) {
+    startPoolFlowAutoCheckLoop(primary.server);
+    const cfg = getPoolFlowAutoCheckDefaults();
+    console.log(
+      `🧪 pool flow precheck: enabled (every ${Math.round(cfg.intervalMs / 1000)}s, max ${cfg.maxItems}/tick, disableOnFail=${cfg.disableOnFail ? '1' : '0'})`,
+    );
+  } else {
+    console.log('🧪 pool flow precheck: disabled (set PROXY_POOL_FLOW_AUTOCHECK=1 to enable)');
+  }
+
+  return {
+    app,
+    server: primary.server,
+    servers: listeners.map((item) => item.server),
+    host: primary.host,
+    port: primary.port,
+    baseUrl: uiListener.baseUrl,
+    publicBaseUrl: primary.baseUrl,
+    uiBaseUrl: uiListener.baseUrl,
+    lanUrls: primary.lanUrls,
+    listeners: RUNTIME.listeners,
+  };
 }
 
 function getBootstrapInfo() {
