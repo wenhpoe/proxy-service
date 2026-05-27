@@ -1306,7 +1306,8 @@ function mapExecutorMachineRow(row, { requesterMachineId, offlineAfterSeconds = 
     heartbeatAt && Number.isFinite(heartbeatAt.getTime()) && Date.now() - heartbeatAt.getTime() <= offlineAfterSeconds * 1000,
   );
   const rawExecutorStatus = String(row.executor_status || '').trim() || null;
-  const executorStatus = rawExecutorStatus === 'running' && heartbeatFresh ? 'running' : rawExecutorStatus || 'offline';
+  const executorOnline = Boolean(rawExecutorStatus === 'running' && heartbeatFresh);
+  const executorStatus = executorOnline ? 'running' : rawExecutorStatus || 'offline';
   const slotCount = Number(row.slot_count || 0);
   const activeSlots = Number(row.active_slot_count || 0);
   const workerLimit = row.worker_limit != null ? Number(row.worker_limit) : DEFAULT_WORKER_LIMIT;
@@ -1317,14 +1318,14 @@ function mapExecutorMachineRow(row, { requesterMachineId, offlineAfterSeconds = 
     note: row.note ? String(row.note) : null,
     workerLimit,
     allowedProfiles: normalizeProfileNames(Array.isArray(allowedProfiles) ? allowedProfiles : []),
-    canExecute: Boolean(rawExecutorStatus === 'running' && heartbeatFresh && workerLimit > 0 && activeSlots > 0),
+    canExecute: Boolean(executorOnline && workerLimit > 0),
     activatedAt: dateToIso(row.activated_at),
     lastSeenAt: dateToIso(row.last_seen_at),
     executor: {
       registered: Boolean(rawExecutorStatus),
       status: executorStatus,
       rawStatus: rawExecutorStatus,
-      online: Boolean(rawExecutorStatus === 'running' && heartbeatFresh),
+      online: executorOnline,
       heartbeatFresh,
       heartbeatAt: dateToIso(row.executor_heartbeat_at),
       startedAt: dateToIso(row.executor_started_at),

@@ -1325,16 +1325,23 @@ async function listClientExecutorMachines({ requesterMachineId }) {
     });
 }
 
+function machineCanAcceptClientTasks(machine) {
+  if (!machine || typeof machine !== 'object') return false;
+  if (machine.canExecute !== false) return true;
+  const executor = machine.executor && typeof machine.executor === 'object' ? machine.executor : {};
+  return Boolean(executor.online || executor.status === 'running' || executor.heartbeatFresh);
+}
+
 async function resolveRequestedTargetMachineId({ requesterMachineId, requestedTargetMachineId }) {
   const machines = await listClientExecutorMachines({ requesterMachineId: String(requesterMachineId || '').trim() });
   const explicitTargetMachineId = String(requestedTargetMachineId || '').trim();
   const targetMachineId = explicitTargetMachineId
-    || machines.find((item) => item && item.canExecute !== false)?.machineId
+    || machines.find((item) => machineCanAcceptClientTasks(item))?.machineId
     || '';
   if (!targetMachineId) throw new Error('no available executor machine');
   const target = machines.find((item) => item.machineId === targetMachineId);
   if (!target) throw new Error('target machine not found');
-  if (target.canExecute === false) throw new Error('target machine is not available');
+  if (!machineCanAcceptClientTasks(target)) throw new Error('target machine is not available');
   return targetMachineId;
 }
 
