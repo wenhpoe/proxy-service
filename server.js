@@ -309,7 +309,25 @@ const DEFAULT_CHANNEL_CONFIG = {
         upsample: false,
         download: true,
       },
-      default_params: {},
+      default_params: {
+        params: {
+          model: 'dreamina-seedance-2-0-fast-260128',
+          size: '9:16',
+          seconds: 5,
+          extra_body: {
+            resolution: '720p',
+          },
+        },
+      },
+      client_options: {
+        models: [
+          'dreamina-seedance-2-0-fast-260128',
+          'dreamina-seedance-2-0-260128',
+        ],
+        sizes: ['16:9', '9:16', '1:1', '3:4', '4:3'],
+        seconds: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        resolutions: ['480p', '720p', '1080p'],
+      },
       constraints: {
         requires_image: true,
       },
@@ -445,6 +463,48 @@ function normalizeProviderConfig(provider, fallbackKey = '1') {
   };
 }
 
+function normalizeStringList(value, fallback = []) {
+  const source = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[\n,]/g)
+      : fallback;
+  return Array.from(new Set(
+    source
+      .map((item) => String(item || '').trim())
+      .filter(Boolean),
+  ));
+}
+
+function normalizeNumberList(value, fallback = []) {
+  const source = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[\n,]/g)
+      : fallback;
+  return Array.from(new Set(
+    source
+      .map((item) => Number(item))
+      .filter((item) => Number.isFinite(item) && item > 0)
+      .map((item) => Math.round(item)),
+  ));
+}
+
+function normalizeChannelClientOptions(value, fallback = {}) {
+  const raw = value && typeof value === 'object' ? value : {};
+  const source = Object.keys(raw).length ? raw : fallback;
+  const out = {};
+  const models = normalizeStringList(source.models, []);
+  const sizes = normalizeStringList(source.sizes, []);
+  const seconds = normalizeNumberList(source.seconds, []);
+  const resolutions = normalizeStringList(source.resolutions, []);
+  if (models.length) out.models = models;
+  if (sizes.length) out.sizes = sizes;
+  if (seconds.length) out.seconds = seconds;
+  if (resolutions.length) out.resolutions = resolutions;
+  return out;
+}
+
 function normalizeChannelConfig(input) {
   const raw = input && typeof input === 'object' ? input : {};
   const fallback = cloneJson(DEFAULT_CHANNEL_CONFIG);
@@ -454,6 +514,7 @@ function normalizeChannelConfig(input) {
       const item = channel && typeof channel === 'object' ? channel : {};
       const key = String(item.key || item.channel || '').trim().toLowerCase();
       if (!key) return null;
+      const fallbackChannel = fallback.channels.find((it) => it.key === key) || {};
       const rawProviders = Array.isArray(item.providers) && item.providers.length ? item.providers : [{ key: '1', label: '服务商 1', enabled: true }];
       const providers = rawProviders
         .map((provider, providerIndex) => normalizeProviderConfig(provider, String(providerIndex + 1)))
@@ -465,6 +526,10 @@ function normalizeChannelConfig(input) {
         enabledProviders[0]?.key ||
         providers[0]?.key ||
         '1';
+      const defaultParams =
+        item.default_params && typeof item.default_params === 'object' && Object.keys(item.default_params).length
+          ? item.default_params
+          : (fallbackChannel.default_params || {});
       return {
         key,
         label: String(item.label || key).trim() || key,
@@ -473,7 +538,8 @@ function normalizeChannelConfig(input) {
         providers,
         priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : undefined,
         capabilities: item.capabilities && typeof item.capabilities === 'object' ? item.capabilities : {},
-        default_params: item.default_params && typeof item.default_params === 'object' ? item.default_params : {},
+        default_params: defaultParams,
+        client_options: normalizeChannelClientOptions(item.client_options, fallbackChannel.client_options || {}),
         constraints: item.constraints && typeof item.constraints === 'object' ? item.constraints : {},
         order: Number.isFinite(Number(item.order)) ? Number(item.order) : index,
       };
@@ -523,6 +589,10 @@ function buildClientChannelCatalog(config) {
           enabled: true,
           base_url: provider.base_url || undefined,
         })),
+        capabilities: channel.capabilities || {},
+        constraints: channel.constraints || {},
+        default_params: channel.default_params || {},
+        client_options: channel.client_options || {},
       })),
   };
 }
@@ -1208,7 +1278,13 @@ function normalizeAllowedProfilesInput(body) {
   return { hasAllowedProfiles, allowedProfiles };
 }
 
-function listClientExecutorMachines({ requesterMachineId }) {
+async function listClientExecutorMachines({ requesterMachineId }) {
+  try {
+    const mirrored = await taskSystem.listExecutorMachines({ requesterMachineId });
+    if (Array.isArray(mirrored) && mirrored.length) return mirrored;
+  } catch {
+    // Fall back to the local control-plane store when MySQL is unavailable.
+  }
   const store = readStore();
   const machines = store.machines && typeof store.machines === 'object' ? store.machines : {};
   return Object.entries(machines)
@@ -1226,6 +1302,20 @@ function listClientExecutorMachines({ requesterMachineId }) {
         canExecute: allowedProfiles.length > 0,
         activatedAt: entry.activatedAt || null,
         lastSeenAt: entry.lastSeenAt || null,
+        executor: {
+          registered: false,
+          status: 'unknown',
+          online: false,
+          heartbeatFresh: false,
+          heartbeatAt: null,
+          startedAt: null,
+          stoppedAt: null,
+          version: null,
+          host: null,
+          pid: null,
+          slotCount: 0,
+          activeSlots: 0,
+        },
       };
     })
     .sort((a, b) => {
@@ -1235,12 +1325,16 @@ function listClientExecutorMachines({ requesterMachineId }) {
     });
 }
 
-function resolveRequestedTargetMachineId({ requesterMachineId, requestedTargetMachineId }) {
-  const targetMachineId = String(requestedTargetMachineId || '').trim() || String(requesterMachineId || '').trim();
-  if (!targetMachineId) throw new Error('targetMachineId required');
-  const machines = listClientExecutorMachines({ requesterMachineId: String(requesterMachineId || '').trim() });
+async function resolveRequestedTargetMachineId({ requesterMachineId, requestedTargetMachineId }) {
+  const machines = await listClientExecutorMachines({ requesterMachineId: String(requesterMachineId || '').trim() });
+  const explicitTargetMachineId = String(requestedTargetMachineId || '').trim();
+  const targetMachineId = explicitTargetMachineId
+    || machines.find((item) => item && item.canExecute !== false)?.machineId
+    || '';
+  if (!targetMachineId) throw new Error('no available executor machine');
   const target = machines.find((item) => item.machineId === targetMachineId);
   if (!target) throw new Error('target machine not found');
+  if (target.canExecute === false) throw new Error('target machine is not available');
   return targetMachineId;
 }
 
@@ -4292,12 +4386,12 @@ app.get('/v1/client/proxy/:profile', authClient, async (req, res) => {
   return res.json({ ok: true, profile, proxy: null, source: 'none', updatedAt: store.updatedAt || null });
 });
 
-app.get('/v1/client/executor-machines', authClient, (req, res) => {
+app.get('/v1/client/executor-machines', authClient, async (req, res) => {
   const machineId = req.clientMachine.machineId;
   return res.json({
     ok: true,
     submitMachineId: machineId,
-    machines: listClientExecutorMachines({ requesterMachineId: machineId }),
+    machines: await listClientExecutorMachines({ requesterMachineId: machineId }),
   });
 });
 
@@ -4320,7 +4414,7 @@ app.post('/v1/client/assets/register', authClient, async (req, res) => {
 
 app.post('/v1/client/task-batches', authClient, async (req, res) => {
   try {
-    const targetMachineId = resolveRequestedTargetMachineId({
+    const targetMachineId = await resolveRequestedTargetMachineId({
       requesterMachineId: req.clientMachine.machineId,
       requestedTargetMachineId: req.body?.targetMachineId,
     });

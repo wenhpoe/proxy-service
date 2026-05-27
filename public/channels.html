@@ -127,9 +127,35 @@
               <input class="input sm dp-aspect-ratio" placeholder="默认 aspect_ratio" style="min-width:180px; flex:1" />
               <input class="input sm dp-size" placeholder="默认 size（如 9:16）" style="min-width:180px; flex:1" />
               <input type="number" class="input sm dp-seconds" placeholder="默认 seconds" style="min-width:160px; flex:1" />
+              <input class="input sm dp-resolution" placeholder="默认 resolution（如 720p）" style="min-width:160px; flex:1" />
             </div>
             <div class="meta">常用默认参数走可视化表单；仍可在下方 JSON 扩展高级字段。</div>
             <textarea class="channel-default-params" placeholder='高级补充 JSON，例如：{"params":{"channel_options":{"human_speed_preset":"fast"}}}'></textarea>
+          </div>
+
+          <div class="stack" style="gap:10px;">
+            <div>
+              <div class="section-label">客户端选项</div>
+              <div class="meta">客户端会定时拉取这些选项，用于生成页的模型、比例、时长和分辨率下拉框。</div>
+            </div>
+            <div class="row" style="align-items:stretch;">
+              <label class="stack" style="gap:6px; min-width:220px; flex:1;">
+                <span class="section-label">模型列表</span>
+                <textarea class="client-opt-models" placeholder="每行一个模型 ID" style="min-height:72px;"></textarea>
+              </label>
+              <label class="stack" style="gap:6px; min-width:180px; flex:1;">
+                <span class="section-label">画面比例</span>
+                <textarea class="client-opt-sizes" placeholder="16:9&#10;9:16&#10;1:1" style="min-height:72px;"></textarea>
+              </label>
+              <label class="stack" style="gap:6px; min-width:160px; flex:1;">
+                <span class="section-label">视频时长</span>
+                <textarea class="client-opt-seconds" placeholder="4&#10;5&#10;10" style="min-height:72px;"></textarea>
+              </label>
+              <label class="stack" style="gap:6px; min-width:160px; flex:1;">
+                <span class="section-label">分辨率</span>
+                <textarea class="client-opt-resolutions" placeholder="480p&#10;720p&#10;1080p" style="min-height:72px;"></textarea>
+              </label>
+            </div>
           </div>
 
           <div class="stack" style="gap:10px;">
@@ -255,6 +281,7 @@
           const visualDefaultParams = buildVisualDefaultParams(card);
           const extraDefaultParams = safeJsonParse(card.querySelector('.channel-default-params')?.value || '', {});
           const defaultParams = mergeDefaultParams(visualDefaultParams, extraDefaultParams);
+          const clientOptions = buildClientOptions(card);
 
           return {
             key: String(card.querySelector('.channel-key')?.value || '').trim() || 'channel',
@@ -265,6 +292,7 @@
             capabilities,
             constraints,
             default_params: defaultParams,
+            client_options: clientOptions,
             providers,
           };
         });
@@ -319,6 +347,7 @@
         const aspectRatio = String(card.querySelector('.dp-aspect-ratio')?.value || '').trim();
         const size = String(card.querySelector('.dp-size')?.value || '').trim();
         const secondsRaw = String(card.querySelector('.dp-seconds')?.value || '').trim();
+        const resolution = String(card.querySelector('.dp-resolution')?.value || '').trim();
         const seconds = Number(secondsRaw);
         const params = {};
         const channelOptions = {};
@@ -328,7 +357,44 @@
         if (model) params.model = model;
         if (size) params.size = size;
         if (Number.isFinite(seconds) && seconds > 0) params.seconds = seconds;
+        if (resolution) params.extra_body = { resolution };
         return Object.keys(params).length ? { params } : {};
+      }
+
+      function parseClientOptionList(value, { numeric = false } = {}) {
+        const items = String(value || '')
+          .split(/[\n,]/g)
+          .map((item) => item.trim())
+          .filter(Boolean);
+        if (!numeric) return Array.from(new Set(items));
+        return Array.from(new Set(
+          items
+            .map((item) => Number(item))
+            .filter((item) => Number.isFinite(item) && item > 0)
+            .map((item) => Math.round(item)),
+        ));
+      }
+
+      function buildClientOptions(card) {
+        const options = {};
+        const models = parseClientOptionList(card.querySelector('.client-opt-models')?.value || '');
+        const sizes = parseClientOptionList(card.querySelector('.client-opt-sizes')?.value || '');
+        const seconds = parseClientOptionList(card.querySelector('.client-opt-seconds')?.value || '', { numeric: true });
+        const resolutions = parseClientOptionList(card.querySelector('.client-opt-resolutions')?.value || '');
+        if (models.length) options.models = models;
+        if (sizes.length) options.sizes = sizes;
+        if (seconds.length) options.seconds = seconds;
+        if (resolutions.length) options.resolutions = resolutions;
+        return options;
+      }
+
+      function hydrateClientOptions(card, clientOptions) {
+        const options = clientOptions && typeof clientOptions === 'object' ? clientOptions : {};
+        const join = (items) => Array.isArray(items) ? items.join('\n') : '';
+        card.querySelector('.client-opt-models').value = join(options.models);
+        card.querySelector('.client-opt-sizes').value = join(options.sizes);
+        card.querySelector('.client-opt-seconds').value = join(options.seconds);
+        card.querySelector('.client-opt-resolutions').value = join(options.resolutions);
       }
 
       function hydrateVisualDefaultParams(card, defaultParams) {
@@ -339,6 +405,7 @@
         card.querySelector('.dp-aspect-ratio').value = channelOptions.aspect_ratio || '';
         card.querySelector('.dp-size').value = params.size || '';
         card.querySelector('.dp-seconds').value = params.seconds || '';
+        card.querySelector('.dp-resolution').value = params.extra_body?.resolution || '';
       }
 
       function sanitizeExtraDefaultParams(defaultParams) {
@@ -347,6 +414,10 @@
           if (Object.prototype.hasOwnProperty.call(value.params, 'model')) delete value.params.model;
           if (Object.prototype.hasOwnProperty.call(value.params, 'size')) delete value.params.size;
           if (Object.prototype.hasOwnProperty.call(value.params, 'seconds')) delete value.params.seconds;
+          if (value.params.extra_body && typeof value.params.extra_body === 'object') {
+            delete value.params.extra_body.resolution;
+            if (!Object.keys(value.params.extra_body).length) delete value.params.extra_body;
+          }
           if (value.params.channel_options && typeof value.params.channel_options === 'object') {
             delete value.params.channel_options.model_name;
             delete value.params.channel_options.aspect_ratio;
@@ -443,6 +514,7 @@
         node.querySelector('.channel-enabled').checked = channel.enabled !== false;
         node.querySelector('.channel-priority').value = Number(channel.priority || 0) || '';
         hydrateVisualDefaultParams(node, channel.default_params || {});
+        hydrateClientOptions(node, channel.client_options || {});
         node.querySelector('.channel-default-params').value = JSON.stringify(sanitizeExtraDefaultParams(channel.default_params || {}), null, 2);
 
         const capabilitiesRow = node.querySelector('.capabilities-row');

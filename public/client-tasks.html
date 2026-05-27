@@ -59,12 +59,12 @@
             </div>
             <div style="height: 10px"></div>
             <div class="row">
-              <label style="min-width: 110px">首帧图片</label>
-              <input id="firstFrameFile" type="file" accept="image/*" class="input" style="max-width: 420px" />
+              <label style="min-width: 110px">参考图片</label>
+              <input id="firstFrameFile" type="file" accept="image/*" multiple class="input" style="max-width: 420px" />
               <button class="btn" id="btnUseDemoFirstFrame" type="button">填充演示图</button>
             </div>
             <div style="height: 6px"></div>
-            <div class="hint" id="firstFrameHint">可先用演示图快速验证链路；后续再接正式上传能力。会自动写入 <span class="mono">extra_body.firstFrameUrl</span></div>
+            <div class="hint" id="firstFrameHint">可先用演示图快速验证链路；后续再接正式上传能力。会自动写入 <span class="mono">extra_body.images</span></div>
             <div style="height: 6px"></div>
             <textarea id="paramsJson" class="mono" style="min-height: 220px"></textarea>
             <div style="height: 10px"></div>
@@ -138,7 +138,7 @@
             size: '9:16',
             seconds: 5,
             extra_body: {
-              firstFrameUrl: '',
+              images: [],
               generate_audio: true,
             },
           };
@@ -275,9 +275,11 @@
         const publicUrl = 'https://aigc-cdn.toseek.net/flow-task-system/submit-assets/seedance/manual-test/test-seedance.png';
         const params = JSON.parse($('paramsJson').value || '{}');
         params.extra_body = params.extra_body && typeof params.extra_body === 'object' ? params.extra_body : {};
-        params.extra_body.firstFrameUrl = publicUrl;
+        delete params.extra_body.firstFrameUrl;
+        params.extra_body.images = Array.isArray(params.extra_body.images) ? params.extra_body.images : [];
+        if (!params.extra_body.images.includes(publicUrl)) params.extra_body.images.push(publicUrl);
         $('paramsJson').value = JSON.stringify(params, null, 2);
-        setFirstFrameHint(`已填充演示图 firstFrameUrl：${publicUrl}`);
+        setFirstFrameHint(`已填充演示图 images，共 ${params.extra_body.images.length} 张：${publicUrl}`);
       }
 
       async function refreshAll() {

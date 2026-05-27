@@ -316,6 +316,23 @@ async function ensureSchema() {
         updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS cp_executor_nodes (
+        machine_id VARCHAR(191) PRIMARY KEY,
+        status VARCHAR(32) NOT NULL DEFAULT 'stopped',
+        started_at DATETIME(3) NULL,
+        heartbeat_at DATETIME(3) NULL,
+        stopped_at DATETIME(3) NULL,
+        version VARCHAR(64) NULL,
+        host VARCHAR(255) NULL,
+        pid BIGINT NULL,
+        worker_limit INT NULL,
+        metadata_json LONGTEXT NULL,
+        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        KEY idx_cp_executor_nodes_status (status, heartbeat_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
     const [machineNoteCols] = await conn.query(`
       SELECT COLUMN_NAME
       FROM information_schema.COLUMNS
@@ -583,9 +600,23 @@ async function mirrorStoreSnapshotTx(conn, store, { preserveProfileNames = null 
       );
     }
     const placeholders = machineIds.map(() => '?').join(', ');
-    await conn.execute(`DELETE FROM cp_machines WHERE machine_id NOT IN (${placeholders})`, machineIds);
+    await conn.execute(
+      `
+        DELETE m FROM cp_machines AS m
+        LEFT JOIN cp_executor_nodes AS e ON e.machine_id = m.machine_id
+        WHERE m.machine_id NOT IN (${placeholders})
+          AND e.machine_id IS NULL
+      `,
+      machineIds,
+    );
   } else {
-    await conn.execute('DELETE FROM cp_machines');
+    await conn.execute(
+      `
+        DELETE m FROM cp_machines AS m
+        LEFT JOIN cp_executor_nodes AS e ON e.machine_id = m.machine_id
+        WHERE e.machine_id IS NULL
+      `,
+    );
   }
 
   const codeValues = [];
@@ -1259,6 +1290,113 @@ function mapBatchRow(row, tasks) {
   };
 }
 
+function dateToIso(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : String(value);
+}
+
+function mapExecutorMachineRow(row, { requesterMachineId, offlineAfterSeconds = 45 } = {}) {
+  if (!row) return null;
+  const machineId = String(row.machine_id || '').trim();
+  if (!machineId) return null;
+  const heartbeatAt = row.executor_heartbeat_at ? new Date(row.executor_heartbeat_at) : null;
+  const heartbeatFresh = Boolean(
+    heartbeatAt && Number.isFinite(heartbeatAt.getTime()) && Date.now() - heartbeatAt.getTime() <= offlineAfterSeconds * 1000,
+  );
+  const rawExecutorStatus = String(row.executor_status || '').trim() || null;
+  const executorStatus = rawExecutorStatus === 'running' && heartbeatFresh ? 'running' : rawExecutorStatus || 'offline';
+  const slotCount = Number(row.slot_count || 0);
+  const activeSlots = Number(row.active_slot_count || 0);
+  const workerLimit = row.worker_limit != null ? Number(row.worker_limit) : DEFAULT_WORKER_LIMIT;
+  const allowedProfiles = safeJsonParse(row.allowed_profiles_json, []);
+  return {
+    machineId,
+    isSelf: machineId === String(requesterMachineId || '').trim(),
+    note: row.note ? String(row.note) : null,
+    workerLimit,
+    allowedProfiles: normalizeProfileNames(Array.isArray(allowedProfiles) ? allowedProfiles : []),
+    canExecute: Boolean(rawExecutorStatus === 'running' && heartbeatFresh && workerLimit > 0 && activeSlots > 0),
+    activatedAt: dateToIso(row.activated_at),
+    lastSeenAt: dateToIso(row.last_seen_at),
+    executor: {
+      registered: Boolean(rawExecutorStatus),
+      status: executorStatus,
+      rawStatus: rawExecutorStatus,
+      online: Boolean(rawExecutorStatus === 'running' && heartbeatFresh),
+      heartbeatFresh,
+      heartbeatAt: dateToIso(row.executor_heartbeat_at),
+      startedAt: dateToIso(row.executor_started_at),
+      stoppedAt: dateToIso(row.executor_stopped_at),
+      version: row.executor_version ? String(row.executor_version) : null,
+      host: row.executor_host ? String(row.executor_host) : null,
+      pid: row.executor_pid != null ? Number(row.executor_pid) : null,
+      slotCount,
+      activeSlots,
+    },
+  };
+}
+
+async function listExecutorMachines({ requesterMachineId = '', offlineAfterSeconds = 45 } = {}) {
+  if (!mysql.isEnabled()) return [];
+  await ensureSchema();
+  return mysql.withConnection(async (conn) => {
+    const safeOfflineAfterSeconds = Math.max(5, Math.min(600, Number(offlineAfterSeconds) || 45));
+    const [rows] = await conn.query(
+      `
+        SELECT
+          base.machine_id,
+          m.activated_at,
+          m.last_seen_at,
+          COALESCE(m.worker_limit, e.worker_limit, 0) AS worker_limit,
+          m.allowed_profiles_json,
+          m.note,
+          e.status AS executor_status,
+          e.started_at AS executor_started_at,
+          e.heartbeat_at AS executor_heartbeat_at,
+          e.stopped_at AS executor_stopped_at,
+          e.version AS executor_version,
+          e.host AS executor_host,
+          e.pid AS executor_pid,
+          COUNT(s.id) AS slot_count,
+          COALESCE(SUM(CASE WHEN s.is_active = 1 THEN 1 ELSE 0 END), 0) AS active_slot_count
+        FROM (
+          SELECT machine_id FROM cp_machines
+          UNION
+          SELECT machine_id FROM cp_executor_nodes
+        ) AS base
+        LEFT JOIN cp_machines AS m ON m.machine_id = base.machine_id
+        LEFT JOIN cp_executor_nodes AS e ON e.machine_id = base.machine_id
+        LEFT JOIN account_slots AS s ON s.machine_id = base.machine_id
+        GROUP BY
+          base.machine_id,
+          m.activated_at,
+          m.last_seen_at,
+          m.worker_limit,
+          e.worker_limit,
+          m.allowed_profiles_json,
+          m.note,
+          e.status,
+          e.started_at,
+          e.heartbeat_at,
+          e.stopped_at,
+          e.version,
+          e.host,
+          e.pid
+        ORDER BY
+          CASE WHEN base.machine_id = ? THEN 0 ELSE 1 END,
+          CASE WHEN e.status = 'running' AND e.heartbeat_at > DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? SECOND) THEN 0 ELSE 1 END,
+          base.machine_id ASC
+      `,
+      [String(requesterMachineId || '').trim(), safeOfflineAfterSeconds],
+    );
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) => mapExecutorMachineRow(row, { requesterMachineId, offlineAfterSeconds: safeOfflineAfterSeconds }))
+      .filter(Boolean);
+  });
+}
+
 async function getTaskArtifacts({ taskIds, conn = null }) {
   const ids = Array.isArray(taskIds) ? taskIds.filter(Boolean) : [];
   if (!ids.length) return new Map();
@@ -1719,6 +1857,7 @@ module.exports = {
   getClientTaskBatch,
   getAdminTaskStats,
   listClientTaskBatches,
+  listExecutorMachines,
   listAccountControls,
   listAdminBatches,
   listAdminTasks,
