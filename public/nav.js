@@ -12,7 +12,6 @@
     { href: '/', label: '代理池' },
     { href: '/nodes.html', label: '节点' },
     { href: '/accounts.html', label: '账号仓库' },
-    { href: '/client-tasks.html', label: '客户端任务' },
     { href: '/channels.html', label: '渠道配置' },
     { href: '/codes.html', label: '激活码' },
     { href: '/admin.html', label: '设备管理' },

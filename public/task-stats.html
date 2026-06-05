@@ -7,12 +7,12 @@
     <link rel="stylesheet" href="/app.css" />
     <script src="/nav.js" defer></script>
     <script src="/time.js" defer></script>
-    <style>
-      .stat-grid {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
-      }
+	    <style>
+	      .stat-grid {
+	        display: grid;
+	        grid-template-columns: repeat(4, minmax(0, 1fr));
+	        gap: 12px;
+	      }
       .stat-card {
         border: 1px solid rgba(23, 29, 26, 0.1);
         border-radius: 16px;
@@ -38,10 +38,18 @@
       @media (max-width: 960px) {
         .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
-      @media (max-width: 560px) {
-        .stat-grid { grid-template-columns: 1fr; }
-      }
-    </style>
+	      @media (max-width: 560px) {
+	        .stat-grid { grid-template-columns: 1fr; }
+	      }
+
+	      .note-ellipsis {
+	        max-width: 320px;
+	        white-space: nowrap;
+	        overflow: hidden;
+	        text-overflow: ellipsis;
+	        color: var(--ink2);
+	      }
+	    </style>
   </head>
   <body>
     <div class="wrap">
@@ -108,7 +116,7 @@
 
     <script>
       const $ = (id) => document.getElementById(id);
-      const state = { stats: null };
+      const state = { stats: null, machineNotes: {} };
 
       function esc(value) {
         return String(value == null ? '' : value)
@@ -159,6 +167,11 @@
         return `<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(value)}</div><div class="stat-sub">${esc(sub)}</div></div>`;
       }
 
+      function machineNote(machineId) {
+        const key = String(machineId || '').trim();
+        return key && state.machineNotes && state.machineNotes[key] ? state.machineNotes[key] : '';
+      }
+
       function renderSummary() {
         const s = state.stats?.summary || {};
         $('summaryGrid').innerHTML = [
@@ -174,6 +187,11 @@
       const tableHead = `
         <tr>
           <th>维度</th><th>任务</th><th>成功</th><th>运行</th><th>排队</th><th>失败</th><th>取消/过期</th><th>run</th><th>输出</th><th>最近更新</th>
+        </tr>`;
+
+      const machineTableHead = `
+        <tr>
+          <th>机器码</th><th>备注</th><th>任务</th><th>成功</th><th>运行</th><th>排队</th><th>失败</th><th>取消/过期</th><th>run</th><th>输出</th><th>最近更新</th>
         </tr>`;
 
       function renderTable(headId, bodyId, rows) {
@@ -199,10 +217,38 @@
         `).join('');
       }
 
+      function renderMachineTable(headId, bodyId, rows) {
+        $(headId).innerHTML = machineTableHead;
+        const list = Array.isArray(rows) ? rows : [];
+        if (!list.length) {
+          $(bodyId).innerHTML = `<tr><td colspan="11"><div class="hint">暂无数据</div></td></tr>`;
+          return;
+        }
+        $(bodyId).innerHTML = list.map((row) => {
+          const key = row.key || '—';
+          const note = machineNote(key) || '—';
+          return `
+            <tr>
+              <td class="mono">${esc(key)}</td>
+              <td title="${esc(note)}"><div class="note-ellipsis">${esc(note)}</div></td>
+              <td>${n(row.totalTasks)}</td>
+              <td>${n(row.succeededTasks)}</td>
+              <td>${n(row.runningTasks)}</td>
+              <td>${n(row.queuedTasks)}</td>
+              <td>${n(row.failedTasks)}</td>
+              <td>${n(row.cancelledTasks)}</td>
+              <td>${n(row.totalRuns)}</td>
+              <td>${n(row.outputCount)}</td>
+              <td>${esc(ts(row.lastUpdatedAt))}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
       function renderAll() {
         renderSummary();
-        renderTable('submitterHead', 'submitterRows', state.stats?.bySubmitter);
-        renderTable('executorHead', 'executorRows', state.stats?.byExecutor);
+        renderMachineTable('submitterHead', 'submitterRows', state.stats?.bySubmitter);
+        renderMachineTable('executorHead', 'executorRows', state.stats?.byExecutor);
         renderTable('channelHead', 'channelRows', state.stats?.byChannel);
         renderTable('statusHead', 'statusRows', state.stats?.byStatus);
       }
@@ -218,8 +264,17 @@
       async function refreshAll({ silent = false } = {}) {
         if (!silent) setStatus('warn', '刷新中…', { autoHideMs: 0 });
         try {
-          const data = await j(`/v1/admin/task-stats?${filters()}`);
-          state.stats = data.stats || null;
+          const [statsResp, machinesResp] = await Promise.all([
+            j(`/v1/admin/task-stats?${filters()}`),
+            j('/v1/admin/machines'),
+          ]);
+          state.stats = statsResp.stats || null;
+          const list = Array.isArray(machinesResp.machines) ? machinesResp.machines : [];
+          state.machineNotes = Object.fromEntries(
+            list
+              .map((m) => [String(m.machineId || '').trim(), String(m.note || '').trim()])
+              .filter(([id]) => id),
+          );
           renderAll();
           pill('ok', '统计在线');
           if (!silent) setStatus('ok', '统计已刷新');

@@ -8,7 +8,7 @@
     <script src="/nav.js" defer></script>
     <script src="/time.js" defer></script>
   </head>
-  <body>
+  <body class="tasks-page">
     <div class="wrap">
       <header class="topbar">
         <div class="brand">
@@ -72,7 +72,6 @@
                     <th style="width: 90px">优先级</th>
                     <th style="width: 110px">尝试</th>
                     <th style="width: 180px">账号 / slot</th>
-                    <th>错误 / 结果</th>
                     <th style="width: 180px">更新时间</th>
                     <th style="width: 170px">操作</th>
                   </tr>
@@ -122,10 +121,45 @@
             </div>
           </div>
         </section>
-      </main>
-    </div>
+        </main>
+      </div>
 
-    <script>
+      <div class="modal" id="taskModal" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="taskModalTitle">
+          <div class="modal-h">
+            <h2 id="taskModalTitle">
+              任务详情 · <span class="mono" id="taskModalTaskId">—</span>
+            </h2>
+            <div class="row">
+              <button class="btn" id="btnCloseTaskModal">关闭</button>
+            </div>
+          </div>
+          <div class="modal-b">
+            <div class="modal-grid">
+              <section class="modal-pane" aria-label="执行详情">
+                <div class="task-modal-body" id="taskModalBody"></div>
+              </section>
+              <aside class="modal-pane modal-side" aria-label="概要 / 操作">
+                <div class="hint">
+                  单击表格行打开详情；按 <span class="mono">Esc</span> 或点击遮罩关闭。
+                </div>
+                <div style="height: 10px"></div>
+                <div class="chips" id="taskModalChips"></div>
+                <div style="height: 10px"></div>
+                <div class="status" id="taskModalStatus" hidden></div>
+                <div style="height: 12px"></div>
+                <div class="modal-actions">
+                  <button class="btn" id="btnModalCopy">复制 ID</button>
+                  <button class="btn" id="btnModalRetry">重试</button>
+                  <button class="btn danger" id="btnModalCancel">取消</button>
+                </div>
+              </aside>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <script>
       const $ = (id) => document.getElementById(id);
 
       async function j(url, opts) {
@@ -157,34 +191,66 @@
         }
       }
 
+      function seedanceRemoteIdFromTask(task) {
+        const raw = task && task.resultPayload && task.resultPayload.raw_result && typeof task.resultPayload.raw_result === "object"
+          ? task.resultPayload.raw_result
+          : {};
+        const remoteId = String(raw.remote_id || raw.id || "").trim();
+        return remoteId || null;
+      }
+
+      function isSeedanceCreateUnknownTask(task) {
+        if (!task || String(task.channel || "").trim().toLowerCase() !== "seedance") return false;
+        const errorClass = String(task.errorClass || "").trim().toLowerCase();
+        const errorCode = String(task.errorCode || "").trim().toLowerCase();
+        if (errorClass !== "seedance_create_unknown" && errorCode !== "seedance_create_unknown") return false;
+        return !seedanceRemoteIdFromTask(task);
+      }
+
       function pill(kind, text) {
         $("led").style.background =
           kind === "ok" ? "#17c964" : kind === "warn" ? "#f5a524" : kind === "err" ? "#f31260" : "#9aa4b2";
         $("pillText").textContent = text;
       }
 
-      function setStatus(kind, text, { autoHideMs = 4500 } = {}) {
-        const el = $("status");
-        if (!text) {
-          el.hidden = true;
-          el.className = "status";
-          el.textContent = "";
-          return;
+        function setStatus(kind, text, { autoHideMs = 4500 } = {}) {
+          const el = $("status");
+          if (!text) {
+            el.hidden = true;
+            el.className = "status";
+            el.textContent = "";
+            return;
+          }
+          const cssKind = kind === "ok" ? "good" : kind === "err" ? "bad" : kind || "";
+          el.hidden = false;
+          el.className = `status ${cssKind}`.trim();
+          el.textContent = text;
+          if (autoHideMs > 0) {
+            clearTimeout(setStatus._t);
+            setStatus._t = setTimeout(() => setStatus("", ""), autoHideMs);
+          }
         }
-        const cssKind = kind === "ok" ? "good" : kind === "err" ? "bad" : kind || "";
-        el.hidden = false;
-        el.className = `status ${cssKind}`.trim();
-        el.textContent = text;
-        if (autoHideMs > 0) {
-          clearTimeout(setStatus._t);
-          setStatus._t = setTimeout(() => setStatus("", ""), autoHideMs);
-        }
-      }
 
-      const state = {
-        tasks: [],
-        batches: [],
-      };
+        function setStatusEl(el, kind, text) {
+          if (!el) return;
+          if (!text) {
+            el.hidden = true;
+            el.className = "status";
+            el.textContent = "";
+            return;
+          }
+          const cssKind = kind === "ok" ? "good" : kind === "err" ? "bad" : kind || "";
+          el.hidden = false;
+          el.className = `status ${cssKind}`.trim();
+          el.textContent = text;
+        }
+
+        const state = {
+          tasks: [],
+          batches: [],
+          modalTaskId: null,
+          modalReturnFocusEl: null,
+        };
 
       function statusTone(value) {
         const status = String(value || "").trim().toLowerCase();
@@ -272,20 +338,24 @@
               )
               .join("")
           : `<div class="task-node empty">暂无输出文件</div>`;
-        return `
-          <details class="task-deep">
-            <summary>
-              执行链路 · ${runs.length} run / ${artifacts.length} 输出${latestRun ? ` / 最近 ${esc(latestRun.status)}` : ""}
-            </summary>
-            <div class="task-deep-body">
-              <div>
-                <div class="section-label">result payload</div>
-                <div class="code-line">${jsonPreview(task.resultPayload, 260)}</div>
-              </div>
-              <div>
-                <div class="section-label">runs</div>
-                <div class="task-node-group">${runList}</div>
-              </div>
+          return `
+            <details class="task-deep" open>
+              <summary class="task-disclosure-summary">
+                <span class="task-disclosure-title">执行链路</span>
+                <span class="badge mono sm">${runs.length} run</span>
+                <span class="badge mono sm">${artifacts.length} 输出</span>
+              ${
+                latestRun
+                  ? `<span class="badge ${statusTone(latestRun.status)} mono sm">最近 ${esc(latestRun.status)}</span>`
+                  : ""
+              }
+              <span class="task-disclosure-caret" aria-hidden="true"></span>
+              </summary>
+              <div class="task-deep-body">
+                <div>
+                  <div class="section-label">runs</div>
+                  <div class="task-node-group">${runList}</div>
+                </div>
               <div>
                 <div class="section-label">artifacts</div>
                 <div class="task-node-group">${artifactList}</div>
@@ -325,7 +395,12 @@
           : `<div class="task-node empty">暂无任务</div>`;
         return `
           <details class="task-tree">
-            <summary>任务树 · ${tasks.length} 任务 / ${runCount} run</summary>
+            <summary class="task-disclosure-summary">
+              <span class="task-disclosure-title">任务树</span>
+              <span class="badge mono sm">${tasks.length} 任务</span>
+              <span class="badge mono sm">${runCount} run</span>
+              <span class="task-disclosure-caret" aria-hidden="true"></span>
+            </summary>
             <div class="task-node-group">${taskList}</div>
           </details>
         `;
@@ -357,63 +432,148 @@
         return params.toString();
       }
 
-      function renderTasks() {
-        const tbody = $("tasksTbody");
-        const rows = Array.isArray(state.tasks) ? state.tasks : [];
-        if (!rows.length) {
-          tbody.innerHTML = `<tr><td colspan="10"><div class="hint">暂无任务</div></td></tr>`;
-          return;
-        }
-        tbody.innerHTML = rows
-          .map((task) => {
-            const errorText = task.errorMessage || task.errorCode || "—";
-            const slotText = task.claimedBySlotId ? `slot#${task.claimedBySlotId}` : "—";
-            const accountText = task.requiredAccountProfile || "动态分配";
-            const attempts = `${task.attemptCount || 0}/${task.maxAttempts || 0}`;
-            const canRetry = ["failed", "cancelled", "expired"].includes(String(task.status || ""));
-            const canCancel = ["queued", "running", "cancel_requested"].includes(String(task.status || ""));
-            return `
-              <tr>
-                <td>
-                  <div class="mono">${esc(task.id)}</div>
-                  <div class="hint mono">batch: ${esc(task.batchId)}</div>
-                  <div class="inline-badges">
-                    <span class="badge mono">${taskRunCount(task)} run</span>
-                    <span class="badge mono">${taskArtifactCount(task)} 输出</span>
+        function renderTasks() {
+          const tbody = $("tasksTbody");
+          const rows = Array.isArray(state.tasks) ? state.tasks : [];
+          if (!rows.length) {
+            tbody.innerHTML = `<tr><td colspan="9"><div class="hint">暂无任务</div></td></tr>`;
+            return;
+          }
+          tbody.innerHTML = rows
+            .map((task) => {
+              const hasError = Boolean(task.errorMessage || task.errorCode);
+              const slotText = task.claimedBySlotId ? `slot#${task.claimedBySlotId}` : "—";
+              const accountText = task.requiredAccountProfile || "动态分配";
+              const attempts = `${task.attemptCount || 0}/${task.maxAttempts || 0}`;
+              const manualSeedanceRetry = isSeedanceCreateUnknownTask(task);
+              const canRetry = ["failed", "cancelled", "expired"].includes(String(task.status || ""));
+              const canCancel = ["queued", "running", "cancel_requested"].includes(String(task.status || ""));
+              return `
+                <tr class="task-row" data-open-task="${esc(task.id)}" title="点击查看详情">
+                  <td>
+                    <div class="task-summary">
+                      <button class="task-id-btn mono" type="button" data-copy-task="${esc(task.id)}" title="复制任务 ID">
+                        ${esc(task.id)}
+                      </button>
+                    <div class="task-metrics">
+                      <span class="badge mono sm">${taskRunCount(task)} run</span>
+                      <span class="badge mono sm">${taskArtifactCount(task)} 输出</span>
+                    </div>
+                    <div class="task-subline mono">
+                      <span class="task-subk">batch</span>
+                      <span class="task-subv">${esc(task.batchId)}</span>
+                    </div>
                   </div>
-                </td>
-                <td><span class="mono">${esc(task.targetMachineId || "—")}</span></td>
-                <td>${esc(task.taskType || "—")}</td>
-                <td>${renderStatusBadge(task.status)}</td>
-                <td>${esc(task.priority || 0)}</td>
-                <td>${esc(attempts)}</td>
-                <td>
-                  <div>${esc(accountText)}</div>
-                  <div class="hint mono">${esc(slotText)}</div>
-                </td>
-                <td>
-                  <div>${esc(errorText)}</div>
-                  <div class="code-line">${jsonPreview(task.resultPayload, 140)}</div>
-                  ${renderTaskDetails(task)}
-                </td>
-                <td>${esc(ts(task.updatedAt || task.createdAt))}</td>
-                <td>
-                  <div class="row">
-                    <button class="btn" data-copy-task="${esc(task.id)}">复制 ID</button>
-                    <button class="btn" data-retry-task="${esc(task.id)}" ${canRetry ? "" : "disabled"}>重试</button>
-                    <button class="btn danger" data-cancel-task="${esc(task.id)}" ${canCancel ? "" : "disabled"}>取消</button>
-                  </div>
-                </td>
+                  </td>
+                  <td><span class="mono">${esc(task.targetMachineId || "—")}</span></td>
+                  <td>${esc(task.taskType || "—")}</td>
+                  <td>
+                    <div class="inline-badges task-badges">
+                      ${renderStatusBadge(task.status)}
+                      ${hasError ? `<span class="badge bad mono sm">ERR</span>` : ""}
+                      ${manualSeedanceRetry ? `<span class="badge mono sm">CREATE?</span>` : ""}
+                    </div>
+                  </td>
+                  <td>${esc(task.priority || 0)}</td>
+                  <td>${esc(attempts)}</td>
+                  <td>
+                    <div class="assign-summary">
+                      <div class="assign-account">${esc(accountText)}</div>
+                      <div class="assign-slot mono">${esc(slotText)}</div>
+                    </div>
+                  </td>
+                  <td>${esc(ts(task.updatedAt || task.createdAt))}</td>
+                  <td data-no-open-task="1">
+                    <div class="row">
+                      <button class="btn sm" data-copy-task="${esc(task.id)}">复制 ID</button>
+                      <button class="btn sm" data-retry-task="${esc(task.id)}" ${canRetry ? "" : "disabled"}>重试</button>
+                      ${
+                        manualSeedanceRetry
+                          ? `<button class="btn sm" data-retry-task="${esc(task.id)}" data-retry-action="retry-seedance-unknown">确认未创建后重跑</button>`
+                          : ""
+                      }
+                      <button class="btn danger sm" data-cancel-task="${esc(task.id)}" ${canCancel ? "" : "disabled"}>取消</button>
+                    </div>
+                  </td>
               </tr>
             `;
-          })
-          .join("");
-      }
+            })
+            .join("");
+        }
 
-      function renderBatches() {
-        const tbody = $("batchesTbody");
-        const rows = Array.isArray(state.batches) ? state.batches : [];
-        if (!rows.length) {
+        function taskById(taskId) {
+          const rows = Array.isArray(state.tasks) ? state.tasks : [];
+          return rows.find((t) => String(t.id) === String(taskId)) || null;
+        }
+
+        function taskChips(task) {
+          const chips = [];
+          chips.push(`<span class="chip"><span class="mono">status</span> <strong>${esc(task.status || "—")}</strong></span>`);
+          chips.push(`<span class="chip"><span class="mono">type</span> <strong>${esc(task.taskType || "—")}</strong></span>`);
+          chips.push(`<span class="chip"><span class="mono">priority</span> <strong>${esc(task.priority || 0)}</strong></span>`);
+          chips.push(
+            `<span class="chip"><span class="mono">attempts</span> <strong>${esc(task.attemptCount || 0)}/${esc(
+              task.maxAttempts || 0,
+            )}</strong></span>`,
+          );
+          if (task.batchId) chips.push(`<span class="chip"><span class="mono">batch</span> <strong>${esc(task.batchId)}</strong></span>`);
+          if (task.targetMachineId)
+            chips.push(`<span class="chip"><span class="mono">machine</span> <strong>${esc(task.targetMachineId)}</strong></span>`);
+          const accountText = task.requiredAccountProfile || "动态分配";
+          chips.push(`<span class="chip"><span class="mono">acct</span> <strong>${esc(accountText)}</strong></span>`);
+          const slotText = task.claimedBySlotId ? `slot#${task.claimedBySlotId}` : "—";
+          chips.push(`<span class="chip"><span class="mono">slot</span> <strong>${esc(slotText)}</strong></span>`);
+          return chips.join("");
+        }
+
+        function openTaskModal(taskId, returnFocusEl = null) {
+          const task = taskById(taskId);
+          if (!task) return;
+
+          const wasHidden = $("taskModal").hidden;
+          state.modalTaskId = String(task.id || "");
+          if (wasHidden) state.modalReturnFocusEl = returnFocusEl || document.activeElement;
+
+          $("taskModalTaskId").textContent = task.id || "—";
+          $("taskModalChips").innerHTML = taskChips(task);
+          $("taskModalBody").innerHTML = `
+            <div class="section-label">错误</div>
+            <div class="code-line">${esc(task.errorMessage || task.errorCode || "—")}</div>
+            <div style="height: 10px"></div>
+            <div class="section-label">result payload</div>
+            <div class="code-line">${jsonPreview(task.resultPayload, 6000)}</div>
+            <div style="height: 10px"></div>
+            ${renderTaskDetails(task)}
+          `;
+
+          const canRetry = ["failed", "cancelled", "expired"].includes(String(task.status || ""));
+          const canCancel = ["queued", "running", "cancel_requested"].includes(String(task.status || ""));
+          const manualSeedanceRetry = isSeedanceCreateUnknownTask(task);
+          $("btnModalRetry").disabled = !(canRetry || manualSeedanceRetry);
+          $("btnModalRetry").dataset.action = manualSeedanceRetry ? "retry-seedance-unknown" : "retry";
+          $("btnModalRetry").textContent = manualSeedanceRetry ? "确认未创建后重跑" : "重试";
+          $("btnModalCancel").disabled = !canCancel;
+
+          if (wasHidden) setStatusEl($("taskModalStatus"), "", "");
+          $("taskModal").hidden = false;
+          if (wasHidden) $("btnCloseTaskModal").focus();
+        }
+
+        function closeTaskModal() {
+          if ($("taskModal").hidden) return;
+          $("taskModal").hidden = true;
+          state.modalTaskId = null;
+          const el = state.modalReturnFocusEl;
+          state.modalReturnFocusEl = null;
+          try {
+            if (el && typeof el.focus === "function") el.focus();
+          } catch {}
+        }
+
+        function renderBatches() {
+          const tbody = $("batchesTbody");
+          const rows = Array.isArray(state.batches) ? state.batches : [];
+          if (!rows.length) {
           tbody.innerHTML = `<tr><td colspan="7"><div class="hint">暂无批次</div></td></tr>`;
           return;
         }
@@ -444,13 +604,14 @@
             j(`/v1/admin/tasks?${taskFilters()}`),
             j(`/v1/admin/task-batches?${batchFilters()}`),
           ]);
-          state.tasks = Array.isArray(tasksResp.tasks) ? tasksResp.tasks : [];
-          state.batches = Array.isArray(batchesResp.batches) ? batchesResp.batches : [];
-          renderTasks();
-          renderBatches();
-          pill("ok", "任务系统在线");
-          if (!silent) setStatus("ok", `已刷新：${state.tasks.length} 个任务 / ${state.batches.length} 个批次`);
-        } catch (err) {
+            state.tasks = Array.isArray(tasksResp.tasks) ? tasksResp.tasks : [];
+            state.batches = Array.isArray(batchesResp.batches) ? batchesResp.batches : [];
+            renderTasks();
+            renderBatches();
+            if (state.modalTaskId && !$("taskModal").hidden) openTaskModal(state.modalTaskId);
+            pill("ok", "任务系统在线");
+            if (!silent) setStatus("ok", `已刷新：${state.tasks.length} 个任务 / ${state.batches.length} 个批次`);
+          } catch (err) {
           pill("err", "任务系统异常");
           if (!silent) setStatus("err", err.message || "刷新失败", { autoHideMs: 8000 });
         }
@@ -459,6 +620,17 @@
       async function postTaskAction(taskId, action) {
         await j(`/v1/admin/tasks/${encodeURIComponent(taskId)}/${action}`, { method: "POST" });
         await refreshAll({ silent: true });
+      }
+
+      function shouldConfirmTaskAction(action) {
+        return action === "retry-seedance-unknown";
+      }
+
+      function taskActionConfirmText(action) {
+        if (action === "retry-seedance-unknown") {
+          return "该任务曾出现“创建结果未知”。只有在你确认上游没有成功创建任务时，才应人工重跑。继续会重新向 Seedance 发起一次新建请求。是否继续？";
+        }
+        return "";
       }
 
       async function copyText(text) {
@@ -489,37 +661,85 @@
         if (e.key === "Enter") refreshAll();
       });
 
-      $("tasksTbody").addEventListener("click", async (e) => {
-        const copyBtn = e.target.closest("[data-copy-task]");
-        if (copyBtn) {
-          const ok = await copyText(copyBtn.getAttribute("data-copy-task") || "");
-          setStatus(ok ? "ok" : "warn", ok ? "已复制任务 ID" : "复制失败");
-          return;
-        }
-        const retryBtn = e.target.closest("[data-retry-task]");
-        if (retryBtn) {
-          try {
-            await postTaskAction(retryBtn.getAttribute("data-retry-task") || "", "retry");
-            setStatus("ok", "已重试任务");
-          } catch (err) {
-            setStatus("err", err.message || "重试失败");
+        $("tasksTbody").addEventListener("click", async (e) => {
+          const copyBtn = e.target.closest("[data-copy-task]");
+          if (copyBtn) {
+            const ok = await copyText(copyBtn.getAttribute("data-copy-task") || "");
+            setStatus(ok ? "ok" : "warn", ok ? "已复制任务 ID" : "复制失败");
+            return;
           }
-          return;
-        }
-        const cancelBtn = e.target.closest("[data-cancel-task]");
-        if (cancelBtn) {
-          try {
-            await postTaskAction(cancelBtn.getAttribute("data-cancel-task") || "", "cancel");
-            setStatus("ok", "已发送取消请求");
-          } catch (err) {
-            setStatus("err", err.message || "取消失败");
+          const retryBtn = e.target.closest("[data-retry-task]");
+          if (retryBtn) {
+            const action = retryBtn.getAttribute("data-retry-action") || "retry";
+            if (shouldConfirmTaskAction(action) && !window.confirm(taskActionConfirmText(action))) return;
+            try {
+              await postTaskAction(retryBtn.getAttribute("data-retry-task") || "", action);
+              setStatus("ok", action === "retry-seedance-unknown" ? "已提交人工重跑" : "已重试任务");
+            } catch (err) {
+              setStatus("err", err.message || (action === "retry-seedance-unknown" ? "人工重跑失败" : "重试失败"));
+            }
+            return;
           }
-        }
-      });
+          const cancelBtn = e.target.closest("[data-cancel-task]");
+          if (cancelBtn) {
+            try {
+              await postTaskAction(cancelBtn.getAttribute("data-cancel-task") || "", "cancel");
+              setStatus("ok", "已发送取消请求");
+            } catch (err) {
+              setStatus("err", err.message || "取消失败");
+            }
+            return;
+          }
+          if (e.target.closest("[data-no-open-task]")) return;
 
-      window.addEventListener("pageshow", () => refreshAll({ silent: true }));
-      refreshAll();
-      setInterval(() => refreshAll({ silent: true }), 5000);
+          const row = e.target.closest("tr.task-row");
+          if (row) {
+            const taskId = row.getAttribute("data-open-task") || "";
+            if (taskId) openTaskModal(taskId, row);
+          }
+        });
+
+        $("btnCloseTaskModal").addEventListener("click", () => closeTaskModal());
+        $("taskModal").addEventListener("click", (e) => {
+          if (e.target === $("taskModal")) closeTaskModal();
+        });
+        window.addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && !$("taskModal").hidden) closeTaskModal();
+        });
+
+        $("btnModalCopy").addEventListener("click", async () => {
+          const taskId = state.modalTaskId || "";
+          const ok = await copyText(taskId);
+          setStatusEl($("taskModalStatus"), ok ? "ok" : "warn", ok ? "已复制任务 ID" : "复制失败");
+        });
+        $("btnModalRetry").addEventListener("click", async () => {
+          const taskId = state.modalTaskId || "";
+          if (!taskId) return;
+          const action = $("btnModalRetry").dataset.action || "retry";
+          if (shouldConfirmTaskAction(action) && !window.confirm(taskActionConfirmText(action))) return;
+          try {
+            await postTaskAction(taskId, action);
+            setStatusEl($("taskModalStatus"), "ok", action === "retry-seedance-unknown" ? "已提交人工重跑" : "已重试任务");
+            openTaskModal(taskId);
+          } catch (err) {
+            setStatusEl($("taskModalStatus"), "err", err.message || (action === "retry-seedance-unknown" ? "人工重跑失败" : "重试失败"));
+          }
+        });
+        $("btnModalCancel").addEventListener("click", async () => {
+          const taskId = state.modalTaskId || "";
+          if (!taskId) return;
+          try {
+            await postTaskAction(taskId, "cancel");
+            setStatusEl($("taskModalStatus"), "ok", "已发送取消请求");
+            openTaskModal(taskId);
+          } catch (err) {
+            setStatusEl($("taskModalStatus"), "err", err.message || "取消失败");
+          }
+        });
+
+        window.addEventListener("pageshow", () => refreshAll({ silent: true }));
+        refreshAll();
+        setInterval(() => refreshAll({ silent: true }), 5000);
     </script>
   </body>
 </html>

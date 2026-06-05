@@ -10,6 +10,15 @@ const { execFile, execFileSync } = require('child_process');
 const { parseSubscriptionToNodes } = require('./decode-sub');
 const taskSystem = require('./core/taskSystem');
 const mysqlCtl = require('./core/mysql');
+const {
+  readChannelConfigFile,
+  writeChannelConfigFile,
+} = require('./core/channelConfig');
+const { createChannelCatalogStore } = require('./core/channelCatalogStore');
+const {
+  buildClientCatalogFromRuntime,
+  loadRuntimeCatalog,
+} = require('./core/channelCatalogRuntime');
 let YAML = null;
 try {
   // Optional dependency for YAML file import (Clash config).
@@ -264,86 +273,6 @@ try {
 const PORT = Number(process.env.PROXY_SERVICE_PORT || 3123);
 // Default to LAN-accessible (admin machine in intranet).
 const HOST = process.env.PROXY_SERVICE_HOST || '0.0.0.0';
-const DEFAULT_CHANNEL_CONFIG = {
-  version: 1,
-  channels: [
-    {
-      key: 'flow',
-      label: 'Flow',
-      enabled: true,
-      selected_provider: '1',
-      priority: 100,
-      capabilities: {
-        image_to_image: true,
-        text_to_image: true,
-        upsample: true,
-        download: true,
-      },
-      default_params: {
-        params: {
-          channel_options: {
-            model_name: 'GEM_PIX_2',
-            aspect_ratio: 'IMAGE_ASPECT_RATIO_PORTRAIT',
-          },
-        },
-      },
-      constraints: {},
-      providers: [
-        {
-          key: '1',
-          label: '服务商 1',
-          enabled: true,
-          runner_key: 'flow.provider1',
-        },
-      ],
-    },
-    {
-      key: 'seedance',
-      label: 'Seedance',
-      enabled: true,
-      selected_provider: '1',
-      priority: 200,
-      capabilities: {
-        image_to_image: true,
-        text_to_image: false,
-        upsample: false,
-        download: true,
-      },
-      default_params: {
-        params: {
-          model: 'dreamina-seedance-2-0-fast-260128',
-          size: '9:16',
-          seconds: 5,
-          extra_body: {
-            resolution: '720p',
-          },
-        },
-      },
-      client_options: {
-        models: [
-          'dreamina-seedance-2-0-fast-260128',
-          'dreamina-seedance-2-0-260128',
-        ],
-        sizes: ['16:9', '9:16', '1:1', '3:4', '4:3'],
-        seconds: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        resolutions: ['480p', '720p', '1080p'],
-      },
-      constraints: {
-        requires_image: true,
-      },
-      providers: [
-        {
-          key: '1',
-          label: '服务商 1',
-          enabled: true,
-          runner_key: 'seedance.provider1',
-          base_url: 'https://testapi.genvia.ai',
-          model: 'dreamina-seedance-2-0-260128',
-        },
-      ],
-    },
-  ],
-};
 
 const RUNTIME = {
   host: HOST,
@@ -369,6 +298,8 @@ const STORE_PATH = process.env.PROXY_SERVICE_STORE
 const CHANNEL_CONFIG_PATH = process.env.PROXY_SERVICE_CHANNEL_CONFIG
   ? path.resolve(process.env.PROXY_SERVICE_CHANNEL_CONFIG)
   : path.join(DATA_DIR, 'channels.json');
+const channelCatalogStore = createChannelCatalogStore({ mysqlGateway: mysqlCtl });
+let runtimeChannelCatalog = null;
 
 const ACCOUNTS_DIR = process.env.PROXY_SERVICE_ACCOUNTS_DIR
   ? path.resolve(process.env.PROXY_SERVICE_ACCOUNTS_DIR)
@@ -439,165 +370,39 @@ function addSecondsIso(seconds) {
   return toChinaIso(t);
 }
 
-function safeJsonParseText(text, fallback = null) {
-  try {
-    return JSON.parse(String(text || ''));
-  } catch {
-    return fallback;
-  }
+function readMaterializedChannelConfig() {
+  return readChannelConfigFile(CHANNEL_CONFIG_PATH);
 }
 
-function cloneJson(value) {
-  return safeJsonParseText(JSON.stringify(value), value);
-}
-
-function normalizeProviderConfig(provider, fallbackKey = '1') {
-  const raw = provider && typeof provider === 'object' ? provider : {};
-  const key = String(raw.key || raw.id || fallbackKey).trim() || fallbackKey;
-  return {
-    key,
-    label: String(raw.label || `服务商 ${key}`).trim() || `服务商 ${key}`,
-    enabled: raw.enabled !== false,
-    runner_key: raw.runner_key ? String(raw.runner_key).trim() : undefined,
-    base_url: raw.base_url ? String(raw.base_url).trim() : undefined,
-    model: raw.model ? String(raw.model).trim() : undefined,
-    api_key: raw.api_key ? String(raw.api_key).trim() : undefined,
-    extra: raw.extra && typeof raw.extra === 'object' ? raw.extra : undefined,
-  };
-}
-
-function normalizeStringList(value, fallback = []) {
-  const source = Array.isArray(value)
-    ? value
-    : typeof value === 'string'
-      ? value.split(/[\n,]/g)
-      : fallback;
-  return Array.from(new Set(
-    source
-      .map((item) => String(item || '').trim())
-      .filter(Boolean),
-  ));
-}
-
-function normalizeNumberList(value, fallback = []) {
-  const source = Array.isArray(value)
-    ? value
-    : typeof value === 'string'
-      ? value.split(/[\n,]/g)
-      : fallback;
-  return Array.from(new Set(
-    source
-      .map((item) => Number(item))
-      .filter((item) => Number.isFinite(item) && item > 0)
-      .map((item) => Math.round(item)),
-  ));
-}
-
-function normalizeChannelClientOptions(value, fallback = {}) {
-  const raw = value && typeof value === 'object' ? value : {};
-  const source = Object.keys(raw).length ? raw : fallback;
-  const out = {};
-  const models = normalizeStringList(source.models, []);
-  const sizes = normalizeStringList(source.sizes, []);
-  const seconds = normalizeNumberList(source.seconds, []);
-  const resolutions = normalizeStringList(source.resolutions, []);
-  if (models.length) out.models = models;
-  if (sizes.length) out.sizes = sizes;
-  if (seconds.length) out.seconds = seconds;
-  if (resolutions.length) out.resolutions = resolutions;
-  return out;
-}
-
-function normalizeChannelConfig(input) {
-  const raw = input && typeof input === 'object' ? input : {};
-  const fallback = cloneJson(DEFAULT_CHANNEL_CONFIG);
-  const sourceChannels = Array.isArray(raw.channels) && raw.channels.length ? raw.channels : fallback.channels;
-  const channels = sourceChannels
-    .map((channel, index) => {
-      const item = channel && typeof channel === 'object' ? channel : {};
-      const key = String(item.key || item.channel || '').trim().toLowerCase();
-      if (!key) return null;
-      const fallbackChannel = fallback.channels.find((it) => it.key === key) || {};
-      const rawProviders = Array.isArray(item.providers) && item.providers.length ? item.providers : [{ key: '1', label: '服务商 1', enabled: true }];
-      const providers = rawProviders
-        .map((provider, providerIndex) => normalizeProviderConfig(provider, String(providerIndex + 1)))
-        .filter((provider, providerIndex, arr) => arr.findIndex((it) => it.key === provider.key) === providerIndex);
-      const enabledProviders = providers.filter((provider) => provider.enabled !== false);
-      const selectedProviderRaw = String(item.selected_provider || item.selectedProvider || '').trim();
-      const selectedProvider =
-        (selectedProviderRaw && providers.find((provider) => provider.key === selectedProviderRaw)?.key) ||
-        enabledProviders[0]?.key ||
-        providers[0]?.key ||
-        '1';
-      const defaultParams =
-        item.default_params && typeof item.default_params === 'object' && Object.keys(item.default_params).length
-          ? item.default_params
-          : (fallbackChannel.default_params || {});
-      return {
-        key,
-        label: String(item.label || key).trim() || key,
-        enabled: item.enabled !== false,
-        selected_provider: selectedProvider,
-        providers,
-        priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : undefined,
-        capabilities: item.capabilities && typeof item.capabilities === 'object' ? item.capabilities : {},
-        default_params: defaultParams,
-        client_options: normalizeChannelClientOptions(item.client_options, fallbackChannel.client_options || {}),
-        constraints: item.constraints && typeof item.constraints === 'object' ? item.constraints : {},
-        order: Number.isFinite(Number(item.order)) ? Number(item.order) : index,
-      };
-    })
-    .filter(Boolean)
-    .sort((left, right) => left.order - right.order)
-    .map(({ order, ...rest }) => rest);
-  return {
-    version: Number.isFinite(Number(raw.version)) ? Number(raw.version) : 1,
-    channels,
-  };
+function materializeChannelConfig(config) {
+  return writeChannelConfigFile(CHANNEL_CONFIG_PATH, config);
 }
 
 function readChannelConfig() {
-  try {
-    if (fs.existsSync(CHANNEL_CONFIG_PATH)) {
-      const parsed = safeJsonParseText(fs.readFileSync(CHANNEL_CONFIG_PATH, 'utf8'), null);
-      if (parsed && typeof parsed === 'object') return normalizeChannelConfig(parsed);
-    }
-  } catch {
-    // ignore
+  return runtimeChannelCatalog || readMaterializedChannelConfig();
+}
+
+async function refreshRuntimeChannelCatalog() {
+  runtimeChannelCatalog = await loadRuntimeCatalog({
+    store: channelCatalogStore,
+    materializedPath: CHANNEL_CONFIG_PATH,
+  });
+  return runtimeChannelCatalog;
+}
+
+async function ensureChannelCatalogBootstrap() {
+  if (!mysqlCtl.isEnabled()) {
+    runtimeChannelCatalog = materializeChannelConfig(readMaterializedChannelConfig());
+    return runtimeChannelCatalog;
   }
-  return normalizeChannelConfig(DEFAULT_CHANNEL_CONFIG);
+  await channelCatalogStore.bootstrapFromCatalogIfEmpty(readMaterializedChannelConfig());
+  return refreshRuntimeChannelCatalog();
 }
 
-function writeChannelConfig(config) {
-  const normalized = normalizeChannelConfig(config);
-  fs.mkdirSync(path.dirname(CHANNEL_CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CHANNEL_CONFIG_PATH, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
-  return normalized;
-}
-
-function buildClientChannelCatalog(config) {
-  const normalized = normalizeChannelConfig(config);
-  return {
-    version: normalized.version,
-    channels: normalized.channels
-      .filter((channel) => channel.enabled !== false)
-      .map((channel) => ({
-        key: channel.key,
-        label: channel.label,
-        enabled: true,
-        selected_provider: channel.selected_provider,
-        providers: channel.providers.filter((provider) => provider.enabled !== false).map((provider) => ({
-          key: provider.key,
-          label: provider.label,
-          enabled: true,
-          base_url: provider.base_url || undefined,
-        })),
-        capabilities: channel.capabilities || {},
-        constraints: channel.constraints || {},
-        default_params: channel.default_params || {},
-        client_options: channel.client_options || {},
-      })),
-  };
+async function writeChannelConfig(config) {
+  const saved = await channelCatalogStore.saveCatalog(config);
+  runtimeChannelCatalog = materializeChannelConfig(saved);
+  return runtimeChannelCatalog;
 }
 
 function isExpiredIso(expiresAt) {
@@ -2673,6 +2478,10 @@ function genActivationCode() {
   return `FMA-${rand(4)}-${rand(4)}-${rand(4)}`;
 }
 
+function genMachineToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
 function requireAdmin(req, res, next) {
   const s = getAdminSession(req);
   if (s) {
@@ -2818,7 +2627,7 @@ async function fetchUpstreamProxy(profile) {
 }
 
 const app = express();
-writeChannelConfig(readChannelConfig());
+runtimeChannelCatalog = materializeChannelConfig(readMaterializedChannelConfig());
 app.disable('x-powered-by');
 app.use(express.json({ limit: '10mb' }));
 
@@ -4074,27 +3883,39 @@ app.post('/v1/client/activate', (req, res) => {
 
   const store = readStore();
   const machines = store.machines && typeof store.machines === 'object' ? store.machines : {};
-  if (machines[machineId] && machines[machineId].tokenHash) {
-    return res.status(409).json({ ok: false, error: 'machine already activated' });
-  }
-
   const codes = Array.isArray(store.activationCodes) ? store.activationCodes : [];
   const idx = codes.findIndex((c) => c && String(c.code).toUpperCase() === code);
   if (idx < 0) return res.status(404).json({ ok: false, error: 'code not found' });
-  if (codes[idx].usedAt) return res.status(409).json({ ok: false, error: 'code already used' });
-  if (isExpiredIso(codes[idx].expiresAt)) return res.status(410).json({ ok: false, error: 'code expired' });
+  const currentMachine = machines[machineId] && typeof machines[machineId] === 'object' ? machines[machineId] : null;
+  const currentMachineActivated = Boolean(currentMachine && currentMachine.tokenHash && !currentMachine.resetAt);
+  const codeUsedByMachineId = String(codes[idx]?.usedByMachineId || '').trim();
+  const codeBoundToSameMachine = Boolean(codeUsedByMachineId) && codeUsedByMachineId === machineId;
+  const codeUnused = !codes[idx]?.usedAt;
+  const canRecoverExistingMachine =
+    currentMachineActivated &&
+    (codeBoundToSameMachine || codeUnused);
 
-  // Mark code as used by this machine
-  codes[idx].usedAt = nowIso();
-  codes[idx].usedByMachineId = machineId;
+  if (currentMachineActivated && !canRecoverExistingMachine) {
+    return res.status(409).json({ ok: false, error: 'machine already activated' });
+  }
+  if (codes[idx].usedAt && !canRecoverExistingMachine) return res.status(409).json({ ok: false, error: 'code already used' });
+  if (!codeBoundToSameMachine && isExpiredIso(codes[idx].expiresAt)) {
+    return res.status(410).json({ ok: false, error: 'code expired' });
+  }
+
+  // Mark code as used by this machine on first activation; keep original binding on recovery.
+  if (!codeBoundToSameMachine) {
+    codes[idx].usedAt = nowIso();
+    codes[idx].usedByMachineId = machineId;
+  }
   store.activationCodes = codes;
 
-  const token = crypto.randomBytes(24).toString('base64url');
+  const token = genMachineToken();
   const tokenHash = sha256Hex(token);
-  const prevMachine = machines[machineId] && typeof machines[machineId] === 'object' ? machines[machineId] : {};
+  const prevMachine = currentMachine || {};
   machines[machineId] = {
     ...prevMachine,
-    activatedAt: nowIso(),
+    activatedAt: prevMachine.activatedAt || nowIso(),
     lastSeenAt: nowIso(),
     resetAt: null,
     tokenHash,
@@ -4105,7 +3926,7 @@ app.post('/v1/client/activate', (req, res) => {
   store.machines = machines;
 
   writeStore(store);
-  return res.json({ ok: true, machineId, token });
+  return res.json({ ok: true, machineId, token, recovered: canRecoverExistingMachine });
 });
 
 app.get('/v1/client/device', authClient, (req, res) => {
@@ -4409,7 +4230,7 @@ app.get('/v1/client/executor-machines', authClient, async (req, res) => {
 });
 
 app.get('/v1/client/channels', authClient, (_req, res) => {
-  const catalog = buildClientChannelCatalog(readChannelConfig());
+  const catalog = buildClientCatalogFromRuntime(readChannelConfig());
   return res.json({ ok: true, ...catalog });
 });
 
@@ -4435,6 +4256,7 @@ app.post('/v1/client/task-batches', authClient, async (req, res) => {
       machineId: req.clientMachine.machineId,
       targetMachineId,
       body: req.body || {},
+      channelCatalog: readChannelConfig(),
     });
     return res.json({ ok: true, batch });
   } catch (err) {
@@ -4742,6 +4564,46 @@ app.put('/v1/admin/machines/:machineId', requireAdmin, (req, res) => {
   });
 });
 
+app.post('/v1/admin/machines/:machineId/reissue-token', requireAdmin, (req, res) => {
+  const machineId = String(req.params.machineId || '').trim();
+  if (!machineId) return res.status(400).json({ ok: false, error: 'machineId required' });
+
+  const store = readStore();
+  const machines = store.machines && typeof store.machines === 'object' ? store.machines : {};
+  if (!machines[machineId]) return res.status(404).json({ ok: false, error: 'machine not found' });
+
+  const token = genMachineToken();
+  const tokenHash = sha256Hex(token);
+  const tokenReissuedAt = nowIso();
+  const current = machines[machineId] && typeof machines[machineId] === 'object' ? machines[machineId] : {};
+  machines[machineId] = {
+    ...current,
+    tokenHash,
+    tokenReissuedAt,
+    lastSeenAt: current.lastSeenAt || null,
+    resetAt: current.resetAt || null,
+    allowedProfiles: Array.isArray(current.allowedProfiles) ? current.allowedProfiles : [],
+    workerLimit: normalizeMachineWorkerLimit(current.workerLimit, 7),
+    note: normalizeMachineNote(current.note),
+  };
+  store.machines = machines;
+  const written = writeStore(store);
+
+  res.json({
+    ok: true,
+    machineId,
+    token,
+    tokenReissuedAt,
+    activatedAt: machines[machineId].activatedAt || null,
+    lastSeenAt: machines[machineId].lastSeenAt || null,
+    resetAt: machines[machineId].resetAt || null,
+    allowedProfiles: machines[machineId].allowedProfiles,
+    workerLimit: machines[machineId].workerLimit,
+    note: machines[machineId].note,
+    storeUpdatedAt: written.updatedAt,
+  });
+});
+
 app.post('/v1/admin/machines/:machineId/reset', requireAdmin, (req, res) => {
   const machineId = String(req.params.machineId || '').trim();
   if (!machineId) return res.status(400).json({ ok: false, error: 'machineId required' });
@@ -4833,16 +4695,21 @@ app.get('/v1/admin/task-stats', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/v1/admin/channels', requireAdmin, (_req, res) => {
-  return res.json({ ok: true, config: readChannelConfig(), path: CHANNEL_CONFIG_PATH });
-});
-
-app.put('/v1/admin/channels', requireAdmin, (req, res) => {
+app.get('/v1/admin/channels', requireAdmin, async (_req, res) => {
   try {
-    const config = writeChannelConfig(req.body || {});
+    const config = await refreshRuntimeChannelCatalog();
     return res.json({ ok: true, config, path: CHANNEL_CONFIG_PATH });
   } catch (err) {
-    return res.status(400).json({ ok: false, error: err?.message || 'invalid channel config' });
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.put('/v1/admin/channels', requireAdmin, async (req, res) => {
+  try {
+    const config = await writeChannelConfig(req.body || {});
+    return res.json({ ok: true, config, path: CHANNEL_CONFIG_PATH });
+  } catch (err) {
+    return sendTaskApiError(res, err, 400);
   }
 });
 
@@ -4874,6 +4741,18 @@ app.post('/v1/admin/tasks/:id/cancel', requireAdmin, async (req, res) => {
 app.post('/v1/admin/tasks/:id/retry', requireAdmin, async (req, res) => {
   try {
     const task = await taskSystem.retryTaskByAdmin({
+      taskId: String(req.params.id || '').trim(),
+      actorId: 'admin',
+    });
+    return res.json({ ok: true, task });
+  } catch (err) {
+    return sendTaskApiError(res, err);
+  }
+});
+
+app.post('/v1/admin/tasks/:id/retry-seedance-unknown', requireAdmin, async (req, res) => {
+  try {
+    const task = await taskSystem.retrySeedanceUnknownTaskByAdmin({
       taskId: String(req.params.id || '').trim(),
       actorId: 'admin',
     });
@@ -5409,6 +5288,7 @@ function listenOnce({ port, host }) {
 
 async function startServer({ port = PORT, host = HOST } = {}) {
   ensureStore();
+  await ensureChannelCatalogBootstrap();
   await ensureTaskSystemBootstrap();
 
   const primary = await listenOnce({ port, host });

@@ -45,6 +45,86 @@ function safeJsonStringify(value) {
   return JSON.stringify(value == null ? null : value);
 }
 
+function normalizeObject(value) {
+  return value && typeof value === 'object' ? value : {};
+}
+
+function listEnabledProviders(channel) {
+  const providers = Array.isArray(channel && channel.providers) ? channel.providers : [];
+  return providers.filter((item) => item && item.enabled !== false);
+}
+
+function resolveProviderConfig(channel, preferred) {
+  const preferredKey = String(preferred || '').trim();
+  const enabledProviders = listEnabledProviders(channel);
+  if (preferredKey) {
+    const matched = enabledProviders.find((item) => String(item.key || '').trim() === preferredKey);
+    if (matched) return matched;
+  }
+  const selectedKey = String(channel && channel.selected_provider || '').trim();
+  if (selectedKey) {
+    const selected = enabledProviders.find((item) => String(item.key || '').trim() === selectedKey);
+    if (selected) return selected;
+  }
+  return enabledProviders[0] || null;
+}
+
+function resolveProviderConstraints(provider) {
+  const source = normalizeObject(provider);
+  const direct = normalizeObject(source.constraints);
+  if (Object.keys(direct).length) return direct;
+  return normalizeObject(normalizeObject(source.extra).constraints);
+}
+
+function resolveChannelConstraints(channel, providerKey) {
+  const channelConstraints = normalizeObject(channel && channel.constraints);
+  const providerConstraints = resolveProviderConstraints(resolveProviderConfig(channel, providerKey));
+  if (!Object.keys(providerConstraints).length) return { ...channelConstraints };
+  return {
+    ...channelConstraints,
+    ...providerConstraints,
+  };
+}
+
+function seedanceRemoteIdFromResultPayload(value) {
+  const payload = safeJsonParse(value, {});
+  const rawResult = payload && typeof payload === 'object' && payload.raw_result && typeof payload.raw_result === 'object'
+    ? payload.raw_result
+    : {};
+  const remoteId = String(rawResult.remote_id || rawResult.id || '').trim();
+  return remoteId || null;
+}
+
+function isSeedanceCreateUnknownTaskRow(task) {
+  if (!task || String(task.channel || '').trim().toLowerCase() !== 'seedance') return false;
+  const errorClass = String(task.error_class || '').trim().toLowerCase();
+  const errorCode = String(task.error_code || '').trim().toLowerCase();
+  if (errorClass !== 'seedance_create_unknown' && errorCode !== 'seedance_create_unknown') return false;
+  return !seedanceRemoteIdFromResultPayload(task.result_payload_json);
+}
+
+async function requeueTaskById(conn, taskId) {
+  await conn.execute(
+    `
+      UPDATE tasks
+      SET status = 'queued',
+          next_retry_at = CURRENT_TIMESTAMP(3),
+          lease_until = NULL,
+          heartbeat_at = NULL,
+          claimed_by_slot_id = NULL,
+          current_task_run_id = NULL,
+          error_class = NULL,
+          error_code = NULL,
+          error_message = NULL,
+          result_payload_json = NULL,
+          cancel_requested_at = NULL,
+          updated_at = CURRENT_TIMESTAMP(3)
+      WHERE id = ?
+    `,
+    [taskId],
+  );
+}
+
 function normalizeProfileNames(values) {
   if (!Array.isArray(values)) return [];
   return Array.from(
@@ -1057,6 +1137,24 @@ function normalizeTaskCreateInput(task, defaults = {}) {
     taskSettings: rawTaskSettings,
     outputSettings: rawOutputSettings,
   };
+  if (channel === 'seedance') {
+    if (taskType !== 'video') {
+      throw new Error('seedance requires taskType=video');
+    }
+    const channelCatalog = defaults.channelCatalog && typeof defaults.channelCatalog === 'object'
+      ? defaults.channelCatalog
+      : null;
+    const channelConfig = Array.isArray(channelCatalog?.channels)
+      ? channelCatalog.channels.find((entry) => String(entry?.key || '').trim().toLowerCase() === 'seedance') || null
+      : null;
+    const constraints = resolveChannelConstraints(channelConfig, provider);
+    const requiresReferenceImage = constraints.requires_image === true;
+    const hasReferenceAsset = Boolean(inputPayload.referenceAssetId)
+      || (Array.isArray(inputPayload.referenceAssetIds) && inputPayload.referenceAssetIds.length > 0);
+    if (requiresReferenceImage && !hasReferenceAsset) {
+      throw new Error('seedance requires referenceAssetId');
+    }
+  }
   return {
     channel,
     provider,
@@ -1091,7 +1189,7 @@ async function refreshBatchStatus(batchId, conn = null) {
   return mysql.withConnection(run);
 }
 
-async function createClientTaskBatch({ machineId, targetMachineId = '', body }) {
+async function createClientTaskBatch({ machineId, targetMachineId = '', body, channelCatalog = null }) {
   await ensureSchema();
   const createdByMachineId = String(machineId || '').trim();
   if (!createdByMachineId) throw new Error('machineId required');
@@ -1125,6 +1223,16 @@ async function createClientTaskBatch({ machineId, targetMachineId = '', body }) 
     }
 
     const batchId = makeId('batch');
+    const batchRow = buildQueuedBatchRow({
+      batchId,
+      targetMachineId: effectiveTargetMachineId,
+      createdByMachineId,
+      createdByKind,
+      idempotencyKey,
+      priority,
+      expireAt,
+      metadata: payload.metadata,
+    });
     await conn.execute(
       `
         INSERT INTO task_batches
@@ -1147,10 +1255,22 @@ async function createClientTaskBatch({ machineId, targetMachineId = '', body }) 
       normalizeTaskCreateInput(task, {
         priority,
         maxAttempts: DEFAULT_MAX_ATTEMPTS,
+        channelCatalog,
       }),
     );
+    const createdTaskRows = [];
     for (const item of normalizedTasks) {
       const taskId = makeId('task');
+      createdTaskRows.push(
+        buildQueuedTaskRow({
+          taskId,
+          batchId,
+          targetMachineId: effectiveTargetMachineId,
+          createdByMachineId,
+          item,
+          expireAt,
+        }),
+      );
       await conn.execute(
         `
           INSERT INTO tasks
@@ -1189,7 +1309,7 @@ async function createClientTaskBatch({ machineId, targetMachineId = '', body }) 
         expireAt: expireAt.toISOString(),
       },
     });
-    return getClientTaskBatch({ machineId: createdByMachineId, batchId, conn });
+    return mapBatchRow(batchRow, createdTaskRows.map((row) => mapTaskRow(row)));
   });
 }
 
@@ -1287,6 +1407,72 @@ function mapBatchRow(row, tasks) {
     tasks: taskList,
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at || null,
     updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at || null,
+  };
+}
+
+function buildQueuedTaskRow({
+  taskId,
+  batchId,
+  targetMachineId,
+  createdByMachineId,
+  item,
+  expireAt,
+}) {
+  const now = new Date().toISOString();
+  return {
+    id: String(taskId),
+    batch_id: String(batchId),
+    target_machine_id: String(targetMachineId),
+    created_by_machine_id: String(createdByMachineId),
+    channel: String(item.channel || 'flow'),
+    provider: String(item.provider || '1'),
+    task_type: String(item.taskType),
+    prompt: String(item.prompt),
+    input_payload_json: safeJsonStringify(item.inputPayload),
+    required_account_profile: item.requiredAccountProfile || null,
+    status: 'queued',
+    priority: Number(item.priority || DEFAULT_PRIORITY),
+    attempt_count: 0,
+    max_attempts: Number(item.maxAttempts || DEFAULT_MAX_ATTEMPTS),
+    next_retry_at: now,
+    expire_at: expireAt instanceof Date ? expireAt.toISOString() : expireAt || null,
+    run_timeout_seconds: Number(item.runTimeoutSeconds || 0),
+    claimed_by_slot_id: null,
+    current_task_run_id: null,
+    lease_until: null,
+    heartbeat_at: null,
+    error_class: null,
+    error_code: null,
+    error_message: null,
+    result_payload_json: safeJsonStringify({}),
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+function buildQueuedBatchRow({
+  batchId,
+  targetMachineId,
+  createdByMachineId,
+  createdByKind,
+  idempotencyKey,
+  priority,
+  expireAt,
+  metadata,
+}) {
+  const now = new Date().toISOString();
+  return {
+    id: String(batchId),
+    target_machine_id: String(targetMachineId),
+    created_by_machine_id: String(createdByMachineId),
+    created_by_kind: String(createdByKind || 'client'),
+    idempotency_key: String(idempotencyKey),
+    priority: Number(priority || DEFAULT_PRIORITY),
+    status: 'queued',
+    expire_at: expireAt instanceof Date ? expireAt.toISOString() : expireAt || null,
+    metadata_json: safeJsonStringify(metadata && typeof metadata === 'object' ? metadata : {}),
+    created_at: now,
+    updated_at: now,
   };
 }
 
@@ -1753,6 +1939,12 @@ async function cancelTaskByAdmin({ taskId, actorId }) {
     const [rows] = await conn.execute(`SELECT * FROM tasks WHERE id = ? LIMIT 1`, [taskId]);
     const task = Array.isArray(rows) ? rows[0] : null;
     if (!task) throw new Error('task not found');
+    const seedanceRemoteId = String(task.channel || '').trim().toLowerCase() === 'seedance'
+      ? seedanceRemoteIdFromResultPayload(task.result_payload_json)
+      : null;
+    if (seedanceRemoteId) {
+      throw new Error(`Seedance 任务已存在远端 ID ${seedanceRemoteId}，为避免重复扣费，已禁止直接重试。请先确认远端任务状态。`);
+    }
     const before = mapTaskRow(task);
     if (task.status === 'queued') {
       await conn.execute(
@@ -1804,26 +1996,11 @@ async function retryTaskByAdmin({ taskId, actorId }) {
     const [rows] = await conn.execute(`SELECT * FROM tasks WHERE id = ? LIMIT 1`, [taskId]);
     const task = Array.isArray(rows) ? rows[0] : null;
     if (!task) throw new Error('task not found');
+    if (isSeedanceCreateUnknownTaskRow(task)) {
+      throw new Error('该任务属于 Seedance 创建结果未知状态。请确认上游未成功创建后，再使用“确认未创建后重跑”以避免重复计费。');
+    }
     const before = mapTaskRow(task);
-    await conn.execute(
-      `
-        UPDATE tasks
-        SET status = 'queued',
-            next_retry_at = CURRENT_TIMESTAMP(3),
-            lease_until = NULL,
-            heartbeat_at = NULL,
-            claimed_by_slot_id = NULL,
-            current_task_run_id = NULL,
-            error_class = NULL,
-            error_code = NULL,
-            error_message = NULL,
-            result_payload_json = NULL,
-            cancel_requested_at = NULL,
-            updated_at = CURRENT_TIMESTAMP(3)
-        WHERE id = ?
-      `,
-      [taskId],
-    );
+    await requeueTaskById(conn, taskId);
     await refreshBatchStatus(String(task.batch_id), conn);
     const after = await getClientTask({
       machineId: String(task.target_machine_id),
@@ -1834,6 +2011,36 @@ async function retryTaskByAdmin({ taskId, actorId }) {
       actorKind: 'admin',
       actorId,
       action: 'retry_task',
+      targetKind: 'task',
+      targetId: String(task.id),
+      before,
+      after,
+    });
+    return after;
+  });
+}
+
+async function retrySeedanceUnknownTaskByAdmin({ taskId, actorId }) {
+  await ensureSchema();
+  return mysql.transaction(async (conn) => {
+    const [rows] = await conn.execute(`SELECT * FROM tasks WHERE id = ? LIMIT 1`, [taskId]);
+    const task = Array.isArray(rows) ? rows[0] : null;
+    if (!task) throw new Error('task not found');
+    if (!isSeedanceCreateUnknownTaskRow(task)) {
+      throw new Error('该任务不是 Seedance 创建结果未知状态，不能使用此人工重跑入口。');
+    }
+    const before = mapTaskRow(task);
+    await requeueTaskById(conn, taskId);
+    await refreshBatchStatus(String(task.batch_id), conn);
+    const after = await getClientTask({
+      machineId: String(task.target_machine_id),
+      taskId: String(task.id),
+      conn,
+    });
+    await writeAuditLog({
+      actorKind: 'admin',
+      actorId,
+      action: 'retry_seedance_unknown_task',
       targetKind: 'task',
       targetId: String(task.id),
       before,
@@ -1866,6 +2073,7 @@ module.exports = {
   mirrorAccountStorageState,
   mirrorStoreSnapshot,
   registerClientAsset,
+  retrySeedanceUnknownTaskByAdmin,
   retryTaskByAdmin,
   syncControlPlaneSnapshot,
   upsertAccountControl,

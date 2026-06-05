@@ -121,11 +121,24 @@ npm run start:server
 该服务同时作为“控制面”：
 
 - 客户端激活：`POST /v1/client/activate`（machineId + activationCode → token）
+- 客户端查询机器状态：`GET /v1/client/device`（Bearer token；返回 `activatedAt`、`lastSeenAt`、`resetAt`、`workerLimit`、`allowedProfiles`）
 - 客户端拉取分配账号列表：`GET /v1/client/profiles`（Bearer token）
 - 客户端拉取某账号 storageState：`GET /v1/client/profiles/:profile`（Bearer token）
 - 客户端获取某账号代理：`GET /v1/client/proxy/:profile`（Bearer token，且 profile 必须已分配给该机器码）
   - 优先返回 `proxy`（HTTP/SOCKS，Playwright 可直接使用）
   - 如代理池为空且存在启用节点（`vless://` / `hysteria2://`），会返回 `node`（含 `fullLink`），需要客户端用 sing-box/Clash 落地后再供 Playwright 使用
+- 客户端查询可用执行机：`GET /v1/client/executor-machines`（Bearer token）
+- 客户端查询渠道目录：`GET /v1/client/channels`（Bearer token）
+- 客户端登记参考资产：`POST /v1/client/assets/register`（Bearer token）
+- 客户端创建任务批次：`POST /v1/client/task-batches`（Bearer token）
+- 客户端查询任务批次列表：`GET /v1/client/task-batches`（Bearer token）
+- 客户端查询单个任务批次：`GET /v1/client/task-batches/:id`（Bearer token）
+- 客户端查询单个任务：`GET /v1/client/tasks/:id`（Bearer token）
+
+说明：
+
+- `flow-multi-account` 的聊天生成 / 任务结果刷新已经依赖这组 `/v1/client/*` 任务接口，不再只是“激活后拉账号列表”的轻量客户端。
+- 如果修改这些接口的字段或错误语义，必须同步更新 `flow-multi-account/core/taskClient.js`、聊天/结果页逻辑，以及 workspace 根层 `docs/CONTRACTS.md` / `docs/SMOKE.md`。
 
 管理端（管理员登录后使用）：
 
@@ -133,7 +146,20 @@ npm run start:server
 - 查看激活码：`GET /v1/admin/codes`
 - 查看机器列表：`GET /v1/admin/machines`
 - 设置机器分配：`PUT /v1/admin/machines/:machineId`
+- 为已存在机器补发 token（保留分配）：`POST /v1/admin/machines/:machineId/reissue-token`
+- 重置机器授权并清空分配：`POST /v1/admin/machines/:machineId/reset`
 - 账号仓库：`GET/PUT/DELETE /v1/admin/accounts(/:profile)`
+
+机器恢复说明：
+
+- 当 `flow-multi-account` 本地 `device.json` 丢失 `token`，但服务端 `machines[machineId]` 仍存在时，优先使用 `reissue-token`。
+- 从 `2026-06-05` 起，`POST /v1/client/activate` 也支持“同一 machineId 恢复 token”：
+  - 如果这台机器已激活，且你输入的是这台机器历史上已绑定过的激活码，服务端会直接补发新 token。
+  - 如果这台机器已激活，且你输入的是一个新的未使用激活码，服务端也会把该激活码绑定到当前机器并补发新 token。
+  - 如果激活码已被别的机器使用，仍会拒绝，不允许跨机器恢复。
+- `reissue-token` 会生成新的明文 token 并替换服务端 `tokenHash`，但保留 `allowedProfiles`、`workerLimit`、`note`、`activatedAt` 等机器状态。
+- `reset` 是破坏性动作：它会清空 `tokenHash` 和 `allowedProfiles`，只适合明确要撤销机器授权并重新分配的场景。
+- `reissue-token` 响应里的明文 token 只返回一次，客户端应立即写回本地 `device.json`，不要记录到日志或提交到仓库。
 
 ### 代理格式（支持多种）
 
@@ -158,6 +184,24 @@ npm run start:server
 - `PROXY_SERVICE_ACCOUNTS_DIR=/abs/path/to/accounts`（可选：账号仓库目录）
 
 说明：打包后（dmg/exe）应用资源目录是只读的，因此默认会把可写数据放到 `userData`（macOS: `~/Library/Application Support/Flow 代理管理服务/`；Windows: `%APPDATA%\\Flow 代理管理服务\\`）。
+
+## 渠道配置（`channels.json`）
+
+- 开发/服务端模式（`npm run start:server`）：`proxy-service/data/channels.json`
+- 桌面应用模式（Electron/打包后）：`<userData>/data/channels.json`
+
+启动时 `proxy-service` 会读取、规范化并回写该文件。
+
+- 若已配置 `FLOW_MYSQL_*`：MySQL `request_channels` / `request_channel_providers` 是权威源；当表为空时，会先用现有 `channels.json` bootstrap，再把 MySQL 内容物化回该文件。
+- `GET /v1/client/channels` / `GET /v1/admin/channels` 都读取运行时目录；`PUT /v1/admin/channels` 会先写 MySQL，再回写 `channels.json`。
+- 若未配置 `FLOW_MYSQL_*`：读路径仍可回退到本地 `channels.json`，但管理端写渠道配置会返回 `503 mysql disabled`，避免只改文件不改权威源。
+- provider 级约束当前通过 `providers[].extra.constraints` 持久化；`GET /v1/client/channels` 会把它展开为 `providers[].constraints` 供客户端做前置校验。
+- 当前默认 Seedance 规则：`provider1` 需要参考图，`provider2` 允许纯 prompt 文生视频。
+
+- 当前 schema 版本：`2`
+- legacy `version=1` 会自动补齐默认 provider 配置
+- 当 schema 默认 `selected_provider` 变化时，旧版默认选择会在升级时自动迁移
+- 已升级到 `version=2` 的机器，如果管理员后来手动切回其他 provider，后续启动会保留该显式选择
 
 ## 打包发布（DMG / EXE）
 
