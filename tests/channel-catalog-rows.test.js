@@ -45,10 +45,12 @@ test('catalogToRows expands channels and providers into normalized row sets', ()
   assert.equal(channelRows.length, 1);
   assert.equal(channelRows[0].channel_key, 'seedance');
   assert.equal(channelRows[0].selected_provider_key, '2');
-  assert.equal(providerRows.length, 2);
+  assert.equal(providerRows.length, 3);
   assert.equal(providerRows[1].provider_key, '2');
   assert.equal(providerRows[1].runner_key, 'seedance.provider2');
   assert.equal(providerRows[1].config_json, JSON.stringify({ constraints: { requires_image: false } }));
+  assert.equal(providerRows[2].provider_key, '3');
+  assert.equal(providerRows[2].runner_key, 'seedance.provider3');
 });
 
 test('rowsToCatalog rebuilds the existing catalog contract shape', () => {
@@ -96,4 +98,5 @@ test('rowsToCatalog rebuilds the existing catalog contract shape', () => {
   assert.deepEqual(catalog.channels[0].providers[1].extra, {
     constraints: { requires_image: false },
   });
+  assert.equal(catalog.channels[0].providers[2].runner_key, 'seedance.provider3');
 });

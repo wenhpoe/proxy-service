@@ -11,7 +11,7 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
-test('module bootstrap migrates legacy seedance config to provider2 default', () => {
+test('module bootstrap migrates legacy seedance config to provider3 default', () => {
   const tempDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-service-data-'));
   const channelsPath = path.join(tempDataDir, 'channels.json');
   const legacyConfig = {
@@ -56,10 +56,14 @@ test('module bootstrap migrates legacy seedance config to provider2 default', ()
   const seedance = migrated.channels.find((channel) => channel.key === 'seedance');
   fs.rmSync(tempDataDir, { recursive: true, force: true });
   assert.equal(migrated.version, 2);
-  assert.equal(seedance.selected_provider, '2');
+  assert.equal(seedance.selected_provider, '3');
   assert.ok(
     seedance.providers.some((provider) => provider.key === '2' && provider.runner_key === 'seedance.provider2'),
     'expected startup migration to add seedance.provider2',
+  );
+  assert.ok(
+    seedance.providers.some((provider) => provider.key === '3' && provider.runner_key === 'seedance.provider3'),
+    'expected startup migration to add seedance.provider3',
   );
 });
 

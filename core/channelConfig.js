@@ -40,7 +40,7 @@ const DEFAULT_CHANNEL_CONFIG = {
       key: 'seedance',
       label: 'Seedance',
       enabled: true,
-      selected_provider: '2',
+      selected_provider: '3',
       priority: 200,
       capabilities: {
         image_to_image: true,
@@ -91,6 +91,19 @@ const DEFAULT_CHANNEL_CONFIG = {
           runner_key: 'seedance.provider2',
           base_url: 'https://ark.ap-southeast.bytepluses.com',
           model: 'dreamina-seedance-2-0-260128',
+          extra: {
+            constraints: {
+              requires_image: false,
+            },
+          },
+        },
+        {
+          key: '3',
+          label: '服务商 3 (Morerouter)',
+          enabled: true,
+          runner_key: 'seedance.provider3',
+          base_url: 'https://morerouter.com/api/v3',
+          model: 'dreamina-seedance-2-0-fast-260128',
           extra: {
             constraints: {
               requires_image: false,

@@ -102,7 +102,7 @@ test('createClientTaskBatch returns queued batch snapshot without extra task/run
   );
 });
 
-test('createClientTaskBatch allows seedance provider2 without reference asset but still blocks provider1', async () => {
+test('createClientTaskBatch allows Ark-compatible Seedance providers without reference assets but still blocks provider1', async () => {
   const fakeConn = {
     async query(sql) {
       if (String(sql).includes('CREATE TABLE')) return [[]];
@@ -160,6 +160,12 @@ test('createClientTaskBatch allows seedance provider2 without reference asset bu
             enabled: true,
             constraints: { requires_image: false },
           },
+          {
+            key: '3',
+            label: '服务商 3',
+            enabled: true,
+            constraints: { requires_image: false },
+          },
         ],
       },
     ],
@@ -192,6 +198,34 @@ test('createClientTaskBatch allows seedance provider2 without reference asset bu
 
   assert.equal(provider2Batch.status, 'queued');
   assert.equal(provider2Batch.tasks[0].taskType, 'video');
+
+  const provider3Batch = await taskSystem.createClientTaskBatch({
+    machineId: 'machine-a',
+    targetMachineId: 'machine-a',
+    channelCatalog,
+    body: {
+      idempotencyKey: 'seedance-provider3-no-ref',
+      priority: 50,
+      expireAt: new Date(Date.now() + 60_000).toISOString(),
+      tasks: [
+        {
+          channel: 'seedance',
+          provider: '3',
+          taskType: 'video',
+          prompt: 'text to video',
+          inputPayload: {
+            channel: 'seedance',
+            provider: '3',
+            operation: 'video.generate',
+            params: { prompt: 'text to video' },
+          },
+        },
+      ],
+    },
+  });
+
+  assert.equal(provider3Batch.status, 'queued');
+  assert.equal(provider3Batch.tasks[0].taskType, 'video');
 
   await assert.rejects(
     () => taskSystem.createClientTaskBatch({
